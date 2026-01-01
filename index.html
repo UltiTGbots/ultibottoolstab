@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SolSentinel | Advanced Trading Monitor</title>
+
+    <!-- Tailwind CDN is okay -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Google Sign-in OK -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              background: "#0f172a",
+              surface: "#1e293b",
+              primary: "#10b981",
+              secondary: "#6366f1",
+              accent: "#f43f5e",
+              muted: "#64748b",
+            },
+            fontFamily: {
+              mono: [
+                "ui-monospace",
+                "SFMono-Regular",
+                "Menlo",
+                "Monaco",
+                "Consolas",
+                "Liberation Mono",
+                "Courier New",
+                "monospace",
+              ],
+            },
+          },
+        },
+      };
+    </script>
+
+    <style>
+      body {
+        background-color: #0f172a;
+        color: #f8fafc;
+      }
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1e293b;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #475569;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #64748b;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+
+    <!-- 🚀 THIS STARTS YOUR REACT APP (Vite entry) -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
