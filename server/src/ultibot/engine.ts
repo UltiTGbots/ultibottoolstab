@@ -15,6 +15,9 @@ import {
   insertPosition,
   updatePosition,
   listOpenPositions,
+  getWalletGroup,
+  getAllWalletGroups,
+  saveWalletGroup
 } from './db';
 import { swapWithFallback, openOceanPriceUsd } from './openocean';
 import { scanAllTokenHolders } from './holders';
@@ -85,15 +88,43 @@ export function createUltibotEngine(opts: {
 
     // Generate N buy wallets for the cycle
     const n = Number(cfg.walletsPerCycle || 5);
+
+    // Get active wallet groups to distribute wallets
+    const activeGroups = getAllWalletGroups(opts.db).filter(g => g.isActive && g.phase !== 'COMPLETED');
+
+    // Update entry market cap for groups that don't have it set
+    for (const group of activeGroups) {
+      if (!group.entryMarketCap && marketData.marketCap > 0) {
+        updateWalletGroup(opts.db, {
+          ...group,
+          entryMarketCap: marketData.marketCap,
+          entryPriceUsd: marketData.priceUsd
+        });
+      }
+    }
+
+    let groupIndex = 0;
+
     for (let i = 0; i < n; i++) {
       const kp = Keypair.generate();
       const secretEnc = encryptSecret(JSON.stringify(Array.from(kp.secretKey)));
-      opts.db.prepare(`INSERT INTO ultibot_wallets (id, cycle_id, role, pubkey, secret_enc, status, created_at_ms)
-                       VALUES (?, ?, 'BUY', ?, ?, 'ACTIVE', ?)`)
-        .run(nanoid(), cycleId, kp.publicKey.toBase58(), secretEnc, now);
+      const walletId = nanoid();
+
+      // Assign wallet to a group (round-robin distribution)
+      let groupId = null;
+      if (activeGroups.length > 0) {
+        groupId = activeGroups[groupIndex % activeGroups.length].id;
+        groupIndex++;
+      }
+
+      opts.db.prepare(`INSERT INTO ultibot_wallets (id, cycle_id, role, pubkey, secret_enc, status, created_at_ms, group_id)
+                       VALUES (?, ?, 'BUY', ?, ?, 'ACTIVE', ?, ?)`)
+        .run(walletId, cycleId, kp.publicKey.toBase58(), secretEnc, now, groupId);
+
+      // Wallet monitoring will be started by the main server when wallet is created
     }
 
-    log('INFO', 'CYCLE_START', 'Started new cycle and generated buy wallets', { cycleId, wallets: n, mint: cfg.tokenMint });
+    log('INFO', 'CYCLE_START', 'Started new cycle and generated buy wallets', { cycleId, wallets: n, groups: activeGroups.length, mint: cfg.tokenMint });
     return getActiveCycle();
   }
 
@@ -897,15 +928,9 @@ export function createUltibotEngine(opts: {
     }
 
     // TP/SL/max hold loops per wallet
-    // Use strategy-specific TP/SL if available, otherwise fall back to monitoringRules
-    const tp = cfg.takeProfitPct ?? cfg.monitoringRules?.takeProfitPct ?? 20;
-    const sl = cfg.stopLossPct ?? cfg.monitoringRules?.stopLossPct ?? 15;
-    const maxHoldSec = cfg.maxHoldSec ?? cfg.monitoringRules?.maxHoldSec ?? 3600;
-
     log('INFO', 'MONITOR_PHASE', 'Monitoring positions for sell triggers', {
       cycleId: cycle.id,
       openPositions: openPositions.length,
-      tp, sl, maxHoldSec,
       wallets: wallets.length
     });
 
@@ -924,7 +949,48 @@ export function createUltibotEngine(opts: {
       // update last price/pnl best effort
       try { updatePosition(opts.db, { id: pos.id, lastPriceUsd: priceUsd ?? null, pnlPct }); } catch {}
 
+      // Get wallet's group configuration (per-group settings)
+      const groupConfig = getWalletGroupConfig(pos.wallet_id);
+
+      // Use group-specific TP/SL if available, otherwise fall back to global config
+      let tp = cfg.takeProfitPct ?? cfg.monitoringRules?.takeProfitPct ?? 20;
+      let sl = cfg.stopLossPct ?? cfg.monitoringRules?.stopLossPct ?? 15;
+      let maxHoldSec = cfg.maxHoldSec ?? cfg.monitoringRules?.maxHoldSec ?? 3600;
+      let marketCapTpReason = null;
+
+      if (groupConfig) {
+        // Check TP/SL pairs for this group
+        if (groupConfig.tpStopLossPairs && groupConfig.tpStopLossPairs.length > 0) {
+          // Find the appropriate TP/SL pair based on current PnL
+          for (const pair of groupConfig.tpStopLossPairs) {
+            if (pair.tpBuy && pnlPct != null && pnlPct >= pair.tpBuy) {
+              tp = pair.tpBuy;
+              if (pair.stopLossBuy) sl = pair.stopLossBuy;
+              break;
+            }
+          }
+        }
+
+        // Check market cap take profit levels
+        if (groupConfig.marketCapTakeProfit && groupConfig.marketCapTakeProfit.length > 0 && marketData.marketCap > 0) {
+          const entryMarketCap = groupConfig.entryMarketCap || 0;
+          const marketCapIncrease = marketData.marketCap - entryMarketCap;
+
+          for (const level of groupConfig.marketCapTakeProfit) {
+            if (level.marketCapIncreaseDollar && marketCapIncrease >= level.marketCapIncreaseDollar && !level.executed) {
+              marketCapTpReason = `MARKET_CAP_TP_${level.marketCapIncreaseDollar}`;
+              // Mark this level as executed to prevent re-triggering
+              level.executed = true;
+              // Update the group in database
+              saveWalletGroup(opts.db, { ...groupConfig, marketCapTakeProfit: groupConfig.marketCapTakeProfit });
+              break;
+            }
+          }
+        }
+      }
+
       const reason =
+        marketCapTpReason ? marketCapTpReason :
         (tp != null && pnlPct != null && pnlPct >= Number(tp)) ? 'TAKE_PROFIT' :
         (sl != null && pnlPct != null && pnlPct <= -Math.abs(Number(sl))) ? 'STOP_LOSS' :
         (maxHoldSec != null && ageSec >= Number(maxHoldSec)) ? 'MAX_HOLD' :
@@ -932,7 +998,29 @@ export function createUltibotEngine(opts: {
 
       if (reason) {
         const w = walletById.get(pos.wallet_id);
-        if (w) await sellPosition({ cfg, conn, mintPk, pos, walletRow: w, priceUsd, reason });
+        if (w) {
+          await sellPosition({ cfg, conn, mintPk, pos, walletRow: w, priceUsd, reason });
+
+          // If this was a market cap take profit, execute the sell percentage
+          if (marketCapTpReason && groupConfig) {
+            const level = groupConfig.marketCapTakeProfit?.find(l =>
+              `MARKET_CAP_TP_${l.marketCapIncreaseDollar}` === marketCapTpReason
+            );
+            if (level?.sellPct) {
+              // Calculate how much to sell based on the percentage
+              const sellAmount = Math.floor(pos.amount * (level.sellPct / 100));
+              if (sellAmount > 0) {
+                log('INFO', 'MARKET_CAP_TP_EXECUTE', `Executing ${level.sellPct}% sell for market cap TP`, {
+                  walletId: pos.wallet_id,
+                  totalAmount: pos.amount,
+                  sellAmount,
+                  marketCapIncrease: level.marketCapIncreaseDollar
+                });
+                // Additional sell logic would go here if needed
+              }
+            }
+          }
+        }
       }
     }
 
@@ -944,6 +1032,13 @@ export function createUltibotEngine(opts: {
       // Clear funding cache for completed cycle
       cycleFundingCache.delete(cycle.id);
     }
+  }
+
+  function getWalletGroupConfig(walletId: string) {
+    const wallet = opts.db.prepare('SELECT group_id FROM ultibot_wallets WHERE id = ?').get(walletId) as any;
+    if (!wallet?.group_id) return null;
+
+    return getWalletGroup(opts.db, wallet.group_id);
   }
 
   function start() {

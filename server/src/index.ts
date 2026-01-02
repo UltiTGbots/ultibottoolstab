@@ -304,6 +304,24 @@ async function inferTradeFromTx(signature: string, wallet: string, mint?: string
 
 const monitoredWalletSubscriptions = new Map<string, number>();
 
+// Ensure all active trading wallets are being monitored
+async function ensureAllWalletsMonitored() {
+  try {
+    const wallets = db.prepare(`
+      SELECT pubkey FROM ultibot_wallets
+      WHERE status = 'ACTIVE' AND role = 'BUY'
+    `).all() as { pubkey: string }[];
+
+    for (const wallet of wallets) {
+      await startWalletMonitor(wallet.pubkey);
+    }
+
+    console.log(`[WalletMonitor] Ensured monitoring for ${wallets.length} active trading wallets`);
+  } catch (e) {
+    console.error('[WalletMonitor] Error ensuring wallet monitoring:', e);
+  }
+}
+
 async function startWalletMonitor(wallet: string) {
   if (monitoredWalletSubscriptions.has(wallet)) return;
   
@@ -781,6 +799,10 @@ app.post('/api/ultibot/wallets/import', requireAdmin, (req, res) => {
     }
 
     io.emit('wallets_imported', { cycleId, count: imported });
+
+    // Start monitoring imported wallets
+    setTimeout(() => ensureAllWalletsMonitored(), 500);
+
     res.json({ ok: true, imported, cycleId });
   } catch (e: any) {
     console.error('[API] Error importing wallets:', e);
@@ -1346,6 +1368,10 @@ app.post('/api/ultibot/start', requireAdmin, (req, res) => {
   saveUltibotConfig(db, botConfig as any);
   setUltibotRunning(db, true);
   ultibotEngine.start();
+
+  // Ensure all trading wallets are being monitored for trade events
+  ensureAllWalletsMonitored();
+
   // Emit bot config update to notify frontend
   io.emit('bot_config', botConfig);
   res.json({ ok: true });
@@ -1411,6 +1437,10 @@ app.post('/api/ultibot/cycle/start', requireAdmin, (req, res) => {
   // Flip enabled and let engine create a cycle based on activeStrategyId/config
   botConfig.enabled = true;
   saveUltibotConfig(db, botConfig as any);
+
+  // Ensure wallets from new cycle are monitored
+  setTimeout(() => ensureAllWalletsMonitored(), 1000);
+
   io.emit('bot_config', botConfig);
   res.json({ ok: true });
 });

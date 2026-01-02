@@ -717,25 +717,46 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           }, ...prev].slice(0, 50);
         });
 
-        // Update trading chart with buy/sell events
-        const currentPrice = event.priceUsd || marketData.priceUsd;
-        const currentMC = event.marketCapUsd || marketData.marketCap;
-        const time = new Date().toLocaleTimeString();
-        
+        // Update trading chart with buy/sell events - accumulate on latest data point
         setTradingChartData(prev => {
-          const last = prev[prev.length - 1];
-          const newData = {
-            time,
-            price: currentPrice,
-            marketCap: currentMC,
-            buyVolume: event.type === 'BUY' ? (last?.buyVolume || 0) + Math.abs(event.deltaSol || 0) : last?.buyVolume || 0,
-            sellVolume: event.type === 'SELL' ? (last?.sellVolume || 0) + Math.abs(event.deltaSol || 0) : last?.sellVolume || 0,
-            buyCount: event.type === 'BUY' ? (last?.buyCount || 0) + 1 : last?.buyCount || 0,
-            sellCount: event.type === 'SELL' ? (last?.sellCount || 0) + 1 : last?.sellCount || 0,
-            buys: event.type === 'BUY' ? [...(last?.buys || []), { price: currentPrice, volume: Math.abs(event.deltaSol || 0) }].slice(-10) : last?.buys || [],
-            sells: event.type === 'SELL' ? [...(last?.sells || []), { price: currentPrice, volume: Math.abs(event.deltaSol || 0) }].slice(-10) : last?.sells || [],
+          if (prev.length === 0) {
+            // No data yet, create initial point
+            const time = new Date().toLocaleTimeString();
+            const currentPrice = event.priceUsd || marketData.priceUsd;
+            const currentMC = event.marketCapUsd || marketData.marketCap;
+            return [{
+              time,
+              price: currentPrice,
+              marketCap: currentMC,
+              buyVolume: event.type === 'BUY' ? Math.abs(event.deltaSol || 0) : 0,
+              sellVolume: event.type === 'SELL' ? Math.abs(event.deltaSol || 0) : 0,
+              buyCount: event.type === 'BUY' ? 1 : 0,
+              sellCount: event.type === 'SELL' ? 1 : 0,
+              buys: event.type === 'BUY' ? [{ price: currentPrice, volume: Math.abs(event.deltaSol || 0) }] : [],
+              sells: event.type === 'SELL' ? [{ price: currentPrice, volume: Math.abs(event.deltaSol || 0) }] : [],
+            }];
+          }
+
+          // Update the latest data point by accumulating volume
+          const updated = [...prev];
+          const lastIndex = updated.length - 1;
+          const last = updated[lastIndex];
+          const currentPrice = event.priceUsd || marketData.priceUsd;
+          const currentMC = event.marketCapUsd || marketData.marketCap;
+
+          updated[lastIndex] = {
+            ...last,
+            price: currentPrice, // Update to latest price
+            marketCap: currentMC, // Update to latest market cap
+            buyVolume: event.type === 'BUY' ? (last.buyVolume || 0) + Math.abs(event.deltaSol || 0) : last.buyVolume || 0,
+            sellVolume: event.type === 'SELL' ? (last.sellVolume || 0) + Math.abs(event.deltaSol || 0) : last.sellVolume || 0,
+            buyCount: event.type === 'BUY' ? (last.buyCount || 0) + 1 : last.buyCount || 0,
+            sellCount: event.type === 'SELL' ? (last.sellCount || 0) + 1 : last.sellCount || 0,
+            buys: event.type === 'BUY' ? [...(last.buys || []), { price: currentPrice, volume: Math.abs(event.deltaSol || 0) }].slice(-10) : last.buys || [],
+            sells: event.type === 'SELL' ? [...(last.sells || []), { price: currentPrice, volume: Math.abs(event.deltaSol || 0) }].slice(-10) : last.sells || [],
           };
-          return [...prev, newData].slice(-100); // Keep last 100 data points
+
+          return updated;
         });
       }
     });
@@ -888,6 +909,58 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       socket.disconnect();
     };
   }, []); // Empty deps - only initialize once on mount
+
+  // Initialize trading chart with market data
+  useEffect(() => {
+    if (marketData.priceUsd > 0 && tradingChartData.length === 0) {
+      setTradingChartData([{
+        time: new Date().toLocaleTimeString(),
+        price: marketData.priceUsd,
+        marketCap: marketData.marketCap,
+        buyVolume: 0,
+        sellVolume: 0,
+        buyCount: 0,
+        sellCount: 0,
+        buys: [],
+        sells: [],
+      }]);
+    }
+  }, [marketData.priceUsd, marketData.marketCap, tradingChartData.length]);
+
+  // Update trading chart with market data every 30 seconds
+  useEffect(() => {
+    if (marketData.priceUsd > 0) {
+      const interval = setInterval(() => {
+        setTradingChartData(prev => {
+          const last = prev[prev.length - 1];
+          const time = new Date().toLocaleTimeString();
+
+          // Only add new point if we don't have recent data or price changed significantly
+          const shouldUpdate = !last ||
+            last.time !== time ||
+            Math.abs((last.price || 0) - marketData.priceUsd) / marketData.priceUsd > 0.005; // 0.5% change
+
+          if (shouldUpdate) {
+            return [...prev, {
+              time,
+              price: marketData.priceUsd,
+              marketCap: marketData.marketCap,
+              buyVolume: last?.buyVolume || 0,
+              sellVolume: last?.sellVolume || 0,
+              buyCount: last?.buyCount || 0,
+              sellCount: last?.sellCount || 0,
+              buys: last?.buys || [],
+              sells: last?.sells || [],
+            }].slice(-100); // Keep last 100 points
+          }
+
+          return prev;
+        });
+      }, 30000); // Update every 30 seconds
+
+      return () => clearInterval(interval);
+    }
+  }, [marketData.priceUsd, marketData.marketCap]);
 
   const addLog = (msg: string) => {
     setLogs(prev => [ `[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 50));
