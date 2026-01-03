@@ -75,3 +75,6 @@ console.log('4. Start UltiBot from the UI');
 console.log('5. Monitor the first cycle closely');
 console.log('\n⚠️  SAFETY: Starting with 0.005 SOL per wallet (~$0.10)');
 console.log('🔄 Increase amounts only after successful testing');
+
+
+

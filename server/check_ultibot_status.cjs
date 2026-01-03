@@ -28,3 +28,6 @@ wallets.forEach(wallet => {
 });
 
 db.close();
+
+
+

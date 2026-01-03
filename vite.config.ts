@@ -12,11 +12,11 @@ export default defineConfig(({ mode }) => {
       host: "0.0.0.0",
       proxy: {
         '/api': {
-          target: 'http://localhost:8787',
+          target: 'http://3.21.170.124:8787',
           changeOrigin: true,
         },
         '/socket.io': {
-          target: 'http://localhost:8787',
+          target: 'http://3.21.170.124:8787',
           ws: true,
           changeOrigin: true,
         }
