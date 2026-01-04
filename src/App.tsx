@@ -2114,7 +2114,7 @@ const executeAnonPayBatch = async () => {
     if (marketData.marketCap >= config.targetMarketCapSell) {
         addLog(`🛑 TARGET MARKET CAP ($${config.targetMarketCapSell.toLocaleString()}) REACHED. Stopping.`);
         setAppState(AppState.IDLE);
-      fetch('/api/ultibot/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) }).catch(() => {});
+      authFetch('/api/ultibot/config', { method: 'POST', body: JSON.stringify({ enabled: false }) }).catch(() => {});
         return;
     }
 
@@ -2427,7 +2427,7 @@ const executeAnonPayBatch = async () => {
           if (allComplete) {
             if (marketData.marketCap >= config.targetMarketCapSell) {
               setAppState(AppState.IDLE);
-              fetch('/api/ultibot/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) }).catch(() => {});
+              authFetch('/api/ultibot/config', { method: 'POST', body: JSON.stringify({ enabled: false }) }).catch(() => {});
               addLog(`🛑 Target Market Cap reached. Stopping.`);
             } else {
               setAppState(AppState.RESTARTING);
@@ -2443,9 +2443,8 @@ const executeAnonPayBatch = async () => {
                 initializeCycle(next);
                 setAppState(AppState.RUNNING);
       // Sync config to backend listener
-      fetch('/api/ultibot/config', {
+      authFetch('/api/ultibot/config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           enabled: true,
           tokenMint: monitoredTokenAddress,
@@ -2470,7 +2469,7 @@ const executeAnonPayBatch = async () => {
                 initializeCycle(next);
                 setAppState(AppState.RUNNING);
       // Sync config to backend listener
-      fetch('/api/ultibot/config', {
+      authFetch('/api/ultibot/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

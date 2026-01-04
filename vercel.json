@@ -8,10 +8,6 @@
       "destination": "http://3.21.170.124:8787/api/$1"
     },
     {
-      "source": "/socket.io/(.*)",
-      "destination": "http://3.21.170.124:8787/socket.io/$1"
-    },
-    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
