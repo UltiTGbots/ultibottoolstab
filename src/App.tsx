@@ -161,7 +161,6 @@ const InfoPanel = ({ title, children }: { title: string, children?: React.ReactN
 const App: React.FC = () => {
   // --- Auth State ---
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
   const [showLoginModal, setShowLoginModal] = useState(false);
   
 const [showProfileModal, setShowProfileModal] = useState(false);
@@ -209,51 +208,49 @@ const loadUltibotConfig = async () => {
   }
 };
 
-// Initial authentication check
 useEffect(() => {
-  const checkAuth = async () => {
-    setAuthLoading(true);
-    const token = getToken();
-    if (token) {
-      try {
-        // Try to validate token by making a request
-        const res = await authFetch('/api/ultibot/config', { method: 'GET' });
-        if (res.ok) {
-          // Token is valid, set up authenticated state
-          const profile: UserProfile = {
-            id: 'admin',
-            email: 'admin',
-            name: 'Administrator',
-            username: 'admin',
-            provider: 'EMAIL',
-            role: 'OWNER',
-            wallet: '',
-            promoCode: 'ADMIN',
-            referredBy: null,
-            twitterHandle: null,
-            tiktokHandle: null,
-            facebookHandle: null,
-            createdAt: Date.now(),
-            lastLogin: Date.now(),
-            loginCount: 1,
-          };
-          setUserProfile(profile);
-          setCurrentUserRole('OWNER');
-          loadUltibotConfig();
-        } else {
-          // Token is invalid, clear it
-          localStorage.removeItem('admin_token');
+  if (getToken()) {
+    loadUltibotConfig();
+    
+    // Refresh balances for wallets that have private keys saved (after config loads)
+    const refreshWalletBalances = async () => {
+      // Wait a bit for config to load
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      for (const wallet of specialWallets) {
+        if (wallet.privateKey) {
+          try {
+            const res = await authFetch('/api/wallet/balance', {
+              method: 'POST',
+              body: JSON.stringify({
+                privateKey: wallet.privateKey,
+                rpcUrl: rpcUrl || undefined
+              })
+            });
+            
+            if (res.ok) {
+              const data = await res.json();
+              setSpecialWallets(prev => prev.map(w => {
+                if (w.role === wallet.role) {
+                  return {
+                    ...w,
+                    address: data.publicKey,
+                    balanceSol: data.balance || 0
+                  };
+                }
+                return w;
+              }));
+            }
+          } catch (e) {
+            console.error(`Failed to refresh balance for ${wallet.role}:`, e);
+          }
         }
-      } catch (error) {
-        // Token validation failed, clear it
-        localStorage.removeItem('admin_token');
       }
-    }
-    setAuthLoading(false); // Always set loading to false
-  };
-
-  checkAuth();
-}, []);
+    };
+    
+    setTimeout(refreshWalletBalances, 1000);
+  }
+}, [isLoggedIn]);
 
   // --- View Mode (Landing vs App) ---
   const [viewMode, setViewMode] = useState<'LANDING' | 'APP'>('LANDING');
@@ -362,7 +359,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     return () => clearTimeout(timeoutId);
   }, [walletGroups]);
-
+  
   // AnonPay State
   const [anonPayRecipients, setAnonPayRecipients] = useState<AnonPayRecipient[]>([]);
   const [anonPayRecipientInput, setAnonPayRecipientInput] = useState('');
@@ -976,10 +973,11 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
   // --- REAL RPC FETCHING ---
   const fetchWalletBalances = async (publicKey: string) => {
       addLog(`🔄 Fetching real balances for ${publicKey.substring(0,6)}...`);
-      
+      const RPC_URL = 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6'; // Direct RPC URL
+
       try {
           // 1. Fetch SOL Balance
-          const solResponse = await fetch('/api/solana/token-info?mint=' + encodeURIComponent(monitoredTokenAddress), {
+          const solResponse = await fetch(RPC_URL, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -994,7 +992,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           setUserWalletBalance(solBalance);
 
           // 2. Fetch Token Accounts
-          const tokenResponse = await fetch('/api/solana/token-info?mint=' + encodeURIComponent(monitoredTokenAddress), {
+          const tokenResponse = await fetch(RPC_URL, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -1117,7 +1115,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     }
 
     // Restricted Tabs - check login first, don't set tab yet
-    if (authLoading || !isLoggedIn) {
+    if (!isLoggedIn) {
         setActiveTab(tab); // Set tab so login modal knows where to go
         setShowLoginModal(true);
         return;
@@ -2480,9 +2478,6 @@ const executeAnonPayBatch = async () => {
                     <Shield className="h-8 w-8 text-primary"/>
                     <span className="text-2xl font-bold tracking-tight">Ultibots<span className="text-primary">.xyz</span></span>
                 </div>
-                <div className="flex items-center gap-3">
-                  <button onClick={() => setShowProfileModal(true)} className="bg-gray-800 border border-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-700">Create Profile</button>
-                </div>
                 <div className="hidden md:flex gap-8">
                     <button onClick={() => setViewMode('LANDING')} className="text-white hover:text-primary transition-colors font-bold">Home</button>
                     <button onClick={() => navigateToApp('ULTIBOT')} className="text-gray-400 hover:text-white transition-colors">Tools</button>
@@ -2643,22 +2638,19 @@ const executeAnonPayBatch = async () => {
                    <X/>
                  </button>
               </div>
-              <p className="text-gray-400 mb-6 text-sm text-center">
-                {authLoading ? 'Checking authentication...' : 'Enter your access password to initialize the dashboard.'}
-              </p>
+              <p className="text-gray-400 mb-6 text-sm text-center">Enter your access password to initialize the dashboard.</p>
               
               <div className="space-y-4">
                  <div>
                     <label className="text-xs text-gray-500 block mb-1 font-bold uppercase">Access Password</label>
                     <div className="relative">
-                        <input
-                            type="password"
+                        <input 
+                            type="password" 
                             className="w-full bg-black/50 border border-gray-700 rounded-lg px-4 py-3 text-white outline-none focus:border-primary transition-colors"
                             placeholder="Enter Password..."
                             value={loginPasswordInput}
                             onChange={(e) => setLoginPasswordInput(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && !authLoading && handlePasswordLogin()}
-                            disabled={authLoading}
+                            onKeyDown={(e) => e.key === 'Enter' && handlePasswordLogin()}
                         />
                         <Lock className="absolute right-3 top-3 text-gray-500 w-5 h-5"/>
                     </div>
@@ -2666,16 +2658,8 @@ const executeAnonPayBatch = async () => {
                  
                  {loginError && <p className="text-red-500 text-xs font-bold text-center">{loginError}</p>}
 
-                 <button
-                   onClick={handlePasswordLogin}
-                   disabled={authLoading}
-                   className={`w-full font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-colors shadow-lg ${
-                     authLoading
-                       ? 'bg-gray-600 cursor-not-allowed'
-                       : 'bg-primary text-white hover:bg-emerald-600 shadow-primary/20'
-                   }`}
-                 >
-                   {authLoading ? 'Checking...' : 'Initialize System'} <ArrowRight className="w-4 h-4"/>
+                 <button onClick={handlePasswordLogin} className="w-full bg-primary text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 hover:bg-emerald-600 transition-colors shadow-lg shadow-primary/20">
+                    Initialize System <ArrowRight className="w-4 h-4"/>
                  </button>
               </div>
            </div>
@@ -4704,11 +4688,7 @@ const executeAnonPayBatch = async () => {
           <MarketMaker
             userWalletConnected={userWalletConnected}
             connectedAddress={connectedAddress}
-            connectedProvider={
-              connectedProvider === 'PHANTOM'
-                ? ((window as any).phantom?.solana || (window as any).solana)
-                : (window as any).solflare
-            }
+            connectedProvider={connectedProvider === 'PHANTOM' ? (window as any).phantom?.solana || (window as any).solana : (window as any).solflare}
             usePrivacyMode={config?.strategy?.usePrivacyMode ?? true}
             addLog={addLog}
             unwhitelistedPct={unwhitelistedPct}
