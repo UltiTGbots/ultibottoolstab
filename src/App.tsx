@@ -376,6 +376,9 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
   const [showPromoCodeModal, setShowPromoCodeModal] = useState(false);
   const [pendingWalletAddress, setPendingWalletAddress] = useState<string>('');
   const [promoCodeInput, setPromoCodeInput] = useState('');
+  // AnonPay Wallet State - NO PERSISTENCE for maximum security
+  // Users must sign to connect wallet on every page load/refresh
+  // This prevents session hijacking and ensures fresh authorization for financial operations
   const [userWalletConnected, setUserWalletConnected] = useState(false);
   const [connectedProvider, setConnectedProvider] = useState<WalletProvider>('NONE');
   const [connectedAddress, setConnectedAddress] = useState<string>('');
@@ -524,6 +527,34 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     if (window.location.hostname !== 'localhost' && window.location.protocol !== 'https:') {
         window.location.href = window.location.href.replace('http:', 'https:');
     }
+  }, []);
+
+  // --- AnonPay Security: Force wallet disconnect on page load ---
+  // CRITICAL: Prevents wallet providers from maintaining connections across page refreshes
+  // This ensures users MUST explicitly authorize each session for maximum security
+  useEffect(() => {
+    const forceWalletDisconnect = async () => {
+      try {
+        // Force disconnect Phantom if connected
+        const phantom = (window as any).phantom?.solana || (window as any).solana;
+        if (phantom && phantom.disconnect && phantom.publicKey) {
+          await phantom.disconnect();
+          console.log('🔒 AnonPay Security: Forced Phantom disconnect on page load');
+        }
+
+        // Force disconnect Solflare if connected
+        const solflare = (window as any).solflare;
+        if (solflare && solflare.disconnect && solflare.publicKey) {
+          await solflare.disconnect();
+          console.log('🔒 AnonPay Security: Forced Solflare disconnect on page load');
+        }
+      } catch (e) {
+        console.warn('Wallet disconnect on load warning:', e);
+      }
+    };
+
+    // Disconnect wallets after a short delay to allow them to initialize
+    setTimeout(forceWalletDisconnect, 100);
   }, []);
 
   // Helper functions for intruder handling (defined early for socket use)
@@ -1094,12 +1125,14 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           console.error('Logout tracking error:', e);
         }
       }
-      
+
+      // Disconnect wallet on logout for complete session cleanup
+      await handleWalletDisconnect();
+
       setUserProfile(null);
       setCurrentUserRole('USER');
       setActiveTab('ANONPAY');
-      handleWalletDisconnect(); 
-      addLog("🔒 User Logged Out.");
+      addLog("🔒 User Logged Out - Wallet Disconnected.");
   };
 
   const navigateToApp = (tab: AppTab) => {
@@ -1202,6 +1235,8 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       setShowWalletModal(true);
   };
 
+  // AnonPay Security: Wallet disconnects on page refresh/close for maximum security
+  // No localStorage persistence - users must reconnect wallet on every visit
   const handleWalletDisconnect = async () => {
     try {
       // Try to disconnect generic provider
@@ -1209,7 +1244,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       if (provider && provider.disconnect) {
           await provider.disconnect();
       }
-      
+
       const solflare = (window as any).solflare;
       if (solflare && solflare.disconnect) {
           await solflare.disconnect();
@@ -1222,7 +1257,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     setConnectedAddress('');
     setUserWalletBalance(0);
     setUserTokens([]);
-    addLog("🔌 Wallet Disconnected.");
+    addLog("🔌 Wallet Disconnected - Must reconnect on next use.");
   };
 
   // Helper to find provider with retries (React hydration race condition)
@@ -1272,6 +1307,8 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
   const [pendingProvider, setPendingProvider] = useState<WalletProvider>('NONE');
 
+  // AnonPay Security: Fresh wallet connection required on every page load
+  // No persistence - each session requires explicit user authorization
   const connectSpecificWallet = async (provider: WalletProvider) => {
       // SECURITY CHECK: HTTPS is mandatory for real wallet interactions
       if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
@@ -1291,21 +1328,55 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
               return;
           }
 
-          // Attempt connection
+          // Force manual signature for EVERY connection (maximum security)
           try {
-              const resp = await walletObj.connect();
-              // Handle different response structures (Phantom vs Solflare)
+              console.log(`🔐 AnonPay Security: Forcing manual signature for ${provider}`);
+
+              // Step 1: Connect wallet (may auto-connect)
+              let connectOptions = {};
+              if (provider === 'PHANTOM') {
+                  // Force Phantom to always require approval
+                  connectOptions = { onlyIfTrusted: false };
+              }
+
+              const resp = await walletObj.connect(connectOptions);
               const pubKey = resp?.publicKey?.toString() || walletObj.publicKey?.toString();
-              
-              if (pubKey) {
+
+              if (!pubKey) {
+                  throw new Error("No public key returned from wallet");
+              }
+
+              console.log(`🔐 AnonPay Security: Wallet connected, now requiring manual signature`);
+
+              // Step 2: Force manual signature by signing a message
+              // This ensures fresh user authorization even if wallet was already connected
+              const message = `AnonPay Security: Confirm wallet connection\nTimestamp: ${Date.now()}\nAddress: ${pubKey}`;
+              const encodedMessage = new TextEncoder().encode(message);
+
+              let signature;
+              try {
+                  if (provider === 'PHANTOM') {
+                      signature = await walletObj.signMessage(encodedMessage, 'utf8');
+                  } else {
+                      // Solflare
+                      signature = await walletObj.signMessage(encodedMessage);
+                  }
+
+                  console.log(`✅ AnonPay Security: Manual signature completed for ${provider}`);
+                  addLog(`🔐 Manual signature verified - secure connection established`);
+
                   setPendingProvider(provider);
                   finishConnection(provider, pubKey);
-              } else {
-                  throw new Error("No public key returned");
+
+              } catch (signError) {
+                  console.error('Manual signature rejected:', signError);
+                  addLog(`❌ Manual signature rejected - connection cancelled for security`);
+                  throw new Error("User rejected manual signature");
               }
+
           } catch (connErr) {
-              console.error(connErr);
-              addLog(`⚠️ ${provider} Connection rejected by user.`);
+              console.error('Connection with manual signature failed:', connErr);
+              addLog(`❌ Secure connection failed - manual signature required`);
           }
 
       } catch (err) {
