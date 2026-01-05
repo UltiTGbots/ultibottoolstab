@@ -62,7 +62,20 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
 const httpServer = createServer(app);
-const io = new IOServer(httpServer, { cors: { origin: true, credentials: true } });
+const io = new IOServer(httpServer, {
+  cors: {
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://localhost:8787",
+      "https://ultibottoolstab.vercel.app",
+      /\.vercel\.app$/,
+      /\.now\.sh$/,
+      /\.vercel-preview\.app$/
+    ],
+    credentials: true
+  }
+});
 
 // --- Admin auth (simple session token) ---
 app.post('/api/admin/login', (req, res) => {
@@ -828,6 +841,27 @@ app.post('/api/debug/reset-cycles', requireAdmin, (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
+});
+
+// Check if profile exists without creating one
+app.get('/api/profile/check/:wallet', (req, res) => {
+  const wallet = String(req.params.wallet || '').trim();
+  if (!wallet) return res.status(400).json({ error: 'Wallet address required' });
+
+  const existing = db.prepare(`SELECT wallet, promo_code, username, twitter_handle, tiktok_handle, facebook_handle FROM profiles WHERE wallet=?`).get(wallet) as any;
+  if (!existing) {
+    return res.json({ exists: false });
+  }
+
+  res.json({
+    exists: true,
+    wallet: existing.wallet,
+    username: existing.username,
+    promoCode: existing.promo_code,
+    twitterHandle: existing.twitter_handle,
+    tiktokHandle: existing.tiktok_handle,
+    facebookHandle: existing.facebook_handle
+  });
 });
 
 app.post('/api/profile/connect', (req, res) => {
