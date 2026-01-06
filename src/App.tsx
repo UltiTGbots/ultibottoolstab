@@ -697,10 +697,20 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
   // --- Socket.IO Connection for Real-time Updates ---
   useEffect(() => {
     console.log('Initializing Socket.IO connection...');
-    // Use window.location.origin for Vite proxy, or direct connection in production
-    // Use window.location.origin for Vite proxy (works in dev)
-    // The proxy in vite.config.ts routes /socket.io to backend
-    const socket = socketIOClient(window.location.origin, {
+
+    // For production deployments, connect directly to the external server
+    // In development, use the Vite proxy (window.location.origin)
+    const isProduction = window.location.hostname.includes('vercel.app') ||
+                        window.location.hostname.includes('now.sh') ||
+                        window.location.hostname.includes('vercel-preview.app') ||
+                        window.location.hostname === 'ultibots.xyz' ||
+                        window.location.hostname === 'www.ultibots.xyz';
+
+    const serverUrl = isProduction ? 'http://3.21.170.124:8787' : window.location.origin;
+
+    console.log(`Connecting to Socket.IO server: ${serverUrl}`);
+
+    const socket = socketIOClient(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionDelay: 1000,
@@ -721,7 +731,23 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     socket.on('connect_error', (error) => {
       console.error('Socket.IO connection error:', error);
-      addLog(`🔌 Connection error: ${error.message}`);
+      // Only log connection errors if we're not in a reconnecting state to avoid spam
+      if (!socket.connected) {
+        addLog(`🔌 Connection error: ${error.message}`);
+      }
+    });
+
+    socket.on('reconnect_attempt', (attempt) => {
+      console.log(`Socket.IO reconnect attempt ${attempt}`);
+    });
+
+    socket.on('reconnect', (attempt) => {
+      console.log(`Socket.IO reconnected after ${attempt} attempts`);
+      addLog('🔌 Reconnected to server');
+    });
+
+    socket.on('reconnect_error', (error) => {
+      console.error('Socket.IO reconnect error:', error);
     });
 
     socket.on('unwhitelisted_pct', (data: { unwhitelistedPctTopAccounts: number; ts: number }) => {
@@ -1410,57 +1436,65 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
   const finishConnection = async (provider: WalletProvider, address: string) => {
     setPendingWalletAddress(address);
+    setPendingProvider(provider);
     setShowWalletModal(false);
 
-    // Check if wallet is already registered
+    // Check if profile already exists for this wallet
     try {
-      const checkResponse = await fetch(`/api/profile/check/${address}`);
+      const checkResponse = await fetch(`/api/profile/check/${encodeURIComponent(address)}`);
 
       if (checkResponse.ok) {
-        const data = await checkResponse.json();
-        if (data.exists) {
-          // Existing user - skip promo modal and set profile directly
-          setUserPromoCode(data.promoCode);
-          // Set wallet connection state for existing users
-          setConnectedProvider(provider);
-          setConnectedAddress(address);
-          setUserWalletConnected(true);
-          setPendingWalletAddress('');
-          setProfileUsername('');
-          setPromoCodeInput('');
-          setProfileTwitter('');
-          setProfileTikTok('');
-          setProfileFacebook('');
+        const checkData = await checkResponse.json();
+
+        if (checkData.exists) {
+          // Profile exists, update login stats and connect directly
+          try {
+            await fetch('/api/profile/connect', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                wallet: address,
+              }),
+            });
+          } catch (updateError) {
+            console.warn('Failed to update login stats, but continuing with connection:', updateError);
+          }
+
+          setUserPromoCode(checkData.promoCode);
 
           setUserProfile({
             id: address,
             email: '',
-            name: data.username || `Wallet ${address.substring(0, 6)}`,
+            name: checkData.username || `Wallet ${address.substring(0, 6)}`,
             provider: provider,
             role: 'USER',
             wallet: address,
-            username: data.username,
-            promoCode: data.promoCode,
-            referredBy: null,
-            twitterHandle: null,
-            tiktokHandle: null,
-            facebookHandle: null,
-            createdAt: Date.now(),
-            lastLogin: Date.now(),
-            loginCount: 1,
+            username: checkData.username,
+            promoCode: checkData.promoCode,
+            twitterHandle: checkData.twitterHandle,
+            tiktokHandle: checkData.tiktokHandle,
+            facebookHandle: checkData.facebookHandle,
           });
-          // Fetch wallet balances for existing users
+
+          setConnectedProvider(provider);
+          setConnectedAddress(address);
+          setUserWalletConnected(true);
+          setPendingWalletAddress('');
+
           await fetchWalletBalances(address);
-          addLog(`✅ Welcome back! Wallet connected: ${address.substring(0, 8)}...`);
+
+          addLog(`💳 Connected with ${provider}. Address: ${address.substring(0,6)}...`);
+          addLog(`✅ Profile found! Username: ${checkData.username || 'Generated'}, Promo code: ${checkData.promoCode}`);
+          addLog(`✅ Welcome back!`);
           return;
         }
       }
     } catch (error) {
-      console.warn('Failed to check existing profile:', error);
-      // Continue with normal flow if check fails
+      console.error('Error checking existing profile:', error);
+      // Continue to show promo modal if check fails
     }
 
-    // New user - show promo code modal
+    // Profile doesn't exist, show promo code modal for new profile creation
     setShowPromoCodeModal(true);
   };
 

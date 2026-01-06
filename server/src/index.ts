@@ -58,11 +58,41 @@ const PORT = Number(process.env.PORT || 8787);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
 
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({
+  origin: [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8787",
+    "https://ultibottoolstab.vercel.app",
+    "https://ultibots.xyz",
+    /\.vercel\.app$/,
+    /\.now\.sh$/,
+    /\.vercel-preview\.app$/
+  ],
+  credentials: true
+}));
 app.use(express.json({ limit: '2mb' }));
 
 const httpServer = createServer(app);
-const io = new IOServer(httpServer, { cors: { origin: true, credentials: true } });
+const io = new IOServer(httpServer, {
+  cors: {
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://localhost:8787",
+      "https://ultibottoolstab.vercel.app",
+      "https://ultibots.xyz",
+      /\.vercel\.app$/,
+      /\.now\.sh$/,
+      /\.vercel-preview\.app$/
+    ],
+    credentials: true,
+    methods: ["GET", "POST"],
+    allowedHeaders: ["*"]
+  },
+  allowEIO3: true,
+  transports: ['websocket', 'polling']
+});
 
 // --- Admin auth (simple session token) ---
 app.post('/api/admin/login', (req, res) => {
@@ -183,6 +213,14 @@ type BotConfig = {
   rpcUrl: string;
   botSecretEnc?: string | null;
   monitoringRules: MonitoringRules;
+  jupiterSlippageBps?: number;
+  dryRun?: boolean;
+  activeStrategyId?: string;
+  fundingSecretEnc?: string | null;
+  profitWalletPubkey?: string;
+  buySolPerWalletLamports?: number;
+  holderScanIntervalMs?: number;
+  holderScanTimeoutMs?: number;
 };
 
 let botConfig: BotConfig = loadUltibotConfig(db) as any;
@@ -263,23 +301,24 @@ type TradeEvent = {
 };
 
 async function inferTradeFromTx(signature: string, wallet: string, mint?: string): Promise<TradeEvent | null> {
-  const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+  const conn = getConnection();
+  const tx = await conn.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
   if (!tx) return null;
   const meta = tx.meta;
   if (!meta) return null;
 
   const walletPk = new PublicKey(wallet);
-  const preLamports = tx.transaction.message.accountKeys.find(k => k.pubkey.equals(walletPk)) ? meta.preBalances[tx.transaction.message.accountKeys.findIndex(k => k.pubkey.equals(walletPk))] : undefined;
-  const postLamports = tx.transaction.message.accountKeys.find(k => k.pubkey.equals(walletPk)) ? meta.postBalances[tx.transaction.message.accountKeys.findIndex(k => k.pubkey.equals(walletPk))] : undefined;
+  const preLamports = tx.transaction.message.accountKeys.find((k: any) => k.pubkey.equals(walletPk)) ? meta.preBalances[tx.transaction.message.accountKeys.findIndex((k: any) => k.pubkey.equals(walletPk))] : undefined;
+  const postLamports = tx.transaction.message.accountKeys.find((k: any) => k.pubkey.equals(walletPk)) ? meta.postBalances[tx.transaction.message.accountKeys.findIndex((k: any) => k.pubkey.equals(walletPk))] : undefined;
 
   const deltaSol = (preLamports !== undefined && postLamports !== undefined) ? (postLamports - preLamports) / 1e9 : undefined;
 
   let deltaTokenUi: number | undefined;
   if (mint) {
-    const pre = meta.preTokenBalances?.filter(b => b.owner === wallet && b.mint === mint) ?? [];
-    const post = meta.postTokenBalances?.filter(b => b.owner === wallet && b.mint === mint) ?? [];
-    const preUi = pre.reduce((s, b) => s + Number(b.uiTokenAmount.uiAmount || 0), 0);
-    const postUi = post.reduce((s, b) => s + Number(b.uiTokenAmount.uiAmount || 0), 0);
+    const pre = meta.preTokenBalances?.filter((b: any) => b.owner === wallet && b.mint === mint) ?? [];
+    const post = meta.postTokenBalances?.filter((b: any) => b.owner === wallet && b.mint === mint) ?? [];
+    const preUi = pre.reduce((s: number, b: any) => s + Number(b.uiTokenAmount.uiAmount || 0), 0);
+    const postUi = post.reduce((s: number, b: any) => s + Number(b.uiTokenAmount.uiAmount || 0), 0);
     deltaTokenUi = postUi - preUi;
   }
 
@@ -329,7 +368,8 @@ async function startWalletMonitor(wallet: string) {
     const walletPk = new PublicKey(wallet);
 
     // "mentions" subscription: gets logs where this pubkey is mentioned
-    const subId = connection.onLogs(walletPk, async (logs) => {
+    const conn = getConnection();
+    const subId = conn.onLogs(walletPk, async (logs: any) => {
       try {
         if (!botConfig.enabled) return;
         const mint = botConfig.tokenMint;
@@ -355,7 +395,8 @@ async function startWalletMonitor(wallet: string) {
 async function stopWalletMonitor(wallet: string) {
   const sub = monitoredWalletSubscriptions.get(wallet);
   if (!sub) return;
-  await connection.removeOnLogsListener(sub);
+  const conn = getConnection();
+  await conn.removeOnLogsListener(sub);
   monitoredWalletSubscriptions.delete(wallet);
 }
 
@@ -830,18 +871,26 @@ app.post('/api/debug/reset-cycles', requireAdmin, (req, res) => {
   }
 });
 
-// Check if wallet exists (without creating/updating)
+// Check if profile exists without creating one
 app.get('/api/profile/check/:wallet', (req, res) => {
-  const wallet = String(req.params.wallet);
-  const existing = db.prepare(`SELECT wallet, promo_code, username FROM profiles WHERE wallet=?`).get(wallet) as any;
+  const wallet = String(req.params.wallet || '').trim();
+  if (!wallet) return res.status(400).json({ error: 'Wallet address required' });
 
-  if (existing) {
-    res.json({ exists: true, username: existing.username, promoCode: existing.promo_code });
-  } else {
-    res.json({ exists: false });
+  const existing = db.prepare(`SELECT wallet, promo_code, username, twitter_handle, tiktok_handle, facebook_handle FROM profiles WHERE wallet=?`).get(wallet) as any;
+  if (!existing) {
+    return res.json({ exists: false });
   }
-});
 
+  res.json({
+    exists: true,
+    wallet: existing.wallet,
+    username: existing.username,
+    promoCode: existing.promo_code,
+    twitterHandle: existing.twitter_handle,
+    tiktokHandle: existing.tiktok_handle,
+    facebookHandle: existing.facebook_handle
+  });
+});
 app.post('/api/profile/connect', (req, res) => {
   const Schema = z.object({
     wallet: z.string().min(1),
@@ -1346,8 +1395,8 @@ app.get('/api/solana/token-info', requireAdmin, async (req, res) => {
           };
         }
       }
-    } catch (metadataError) {
-      console.warn('Failed to fetch token metadata:', metadataError.message);
+    } catch (metadataError: any) {
+      console.warn('Failed to fetch token metadata:', metadataError?.message || metadataError);
       // Continue without metadata
     }
 
@@ -1525,7 +1574,7 @@ setInterval(async () => {
       io.emit('server_error', { message: String(e) });
     }
   }
-}, 30000); // Increased to 30s to further reduce RPC load
+}, 60000); // Increased to 60s to reduce RPC load and rate limiting
 
 /**
  * Market Maker API Endpoints
@@ -1999,19 +2048,22 @@ app.get('/api/marketmaker/stats', async (_req, res) => {
         totalTrades: 0,
         totalVolume: 0,
         totalProfit: 0,
-        activeWallets: mmWallets.size,
+        activeWallets: 0,
         currentPrice: 0,
         unwhitelistedHoldingsPct: 0,
       });
     }
-    
+
     const metrics = await computeUnwhitelistedPct(mmConfig.tokenMint, mmConfig.whitelist);
-    
+
+    // Get active wallets count from database
+    const activeWalletsCount = db.prepare('SELECT COUNT(*) as count FROM market_maker_wallets WHERE balance_sol > 0').get() as { count: number };
+
     res.json({
       totalTrades: mmOrders.filter(o => o.status === 'COMPLETED').length,
       totalVolume: mmOrders.reduce((sum, o) => sum + (o.amount || 0), 0),
       totalProfit: 0, // Calculate from completed trades
-      activeWallets: Array.from(mmWallets.values()).filter(w => w.balanceSol > 0).length,
+      activeWallets: activeWalletsCount.count,
       currentPrice: 0, // Fetch from pool
       unwhitelistedHoldingsPct: metrics.unwhitelistedPctTopAccounts,
     });
