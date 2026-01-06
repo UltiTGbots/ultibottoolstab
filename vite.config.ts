@@ -12,11 +12,11 @@ export default defineConfig(({ mode }) => {
       host: "0.0.0.0",
       proxy: {
         '/api': {
-          target: 'http://3.21.170.124:8787',
+          target: env.VITE_API_BASE_URL || 'http://3.21.170.124:8787',
           changeOrigin: true,
         },
         '/socket.io': {
-          target: 'http://3.21.170.124:8787',
+          target: env.VITE_SOCKET_BASE_URL || env.VITE_API_BASE_URL || 'http://3.21.170.124:8787',
           ws: true,
           changeOrigin: true,
         }

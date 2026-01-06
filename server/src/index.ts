@@ -830,6 +830,18 @@ app.post('/api/debug/reset-cycles', requireAdmin, (req, res) => {
   }
 });
 
+// Check if wallet exists (without creating/updating)
+app.get('/api/profile/check/:wallet', (req, res) => {
+  const wallet = String(req.params.wallet);
+  const existing = db.prepare(`SELECT wallet, promo_code, username FROM profiles WHERE wallet=?`).get(wallet) as any;
+
+  if (existing) {
+    res.json({ exists: true, username: existing.username, promoCode: existing.promo_code });
+  } else {
+    res.json({ exists: false });
+  }
+});
+
 app.post('/api/profile/connect', (req, res) => {
   const Schema = z.object({
     wallet: z.string().min(1),
@@ -843,21 +855,21 @@ app.post('/api/profile/connect', (req, res) => {
 
   const existing = db.prepare(`SELECT wallet, promo_code, username FROM profiles WHERE wallet=?`).get(body.wallet) as any;
   const now = Date.now();
-  
+
   if (existing) {
     // Update last login and login count
     db.prepare(`UPDATE profiles SET last_login = ?, login_count = login_count + 1 WHERE wallet=?`).run(now, body.wallet);
-    
+
     // Track login activity for promo code
     db.prepare(`INSERT INTO promo_activity(promo_code, wallet, activity_type, timestamp) VALUES(?, ?, 'LOGIN', ?)`).run(
       existing.promo_code,
       body.wallet,
       now
     );
-    
+
     // Update promo stats login count
     db.prepare(`UPDATE promo_stats SET total_logins = total_logins + 1 WHERE promo_code=?`).run(existing.promo_code);
-    
+
     return res.json({ wallet: body.wallet, username: existing.username, promoCode: existing.promo_code, existing: true });
   }
 

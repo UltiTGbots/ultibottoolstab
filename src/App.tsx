@@ -48,7 +48,7 @@ const ANON_PAY_FEE_PER_TX = 0.001;
 const FEE_COLLECTOR_WALLET = "OIURTHIU*&5r,a.kea;oijsdpoi]aYTUYQPUHb12";
 const DEFAULT_ACCESS_PASSWORD = "321$nimda"; 
 const DEFAULT_ADMIN_PASSWORD = "321$nimda"; // Known mints for display
-const API_BASE = '';  // Use relative paths - works on both localhost and production
+const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';  // Use environment variable or fallback to relative paths
 const KNOWN_MINTS: Record<string, string> = {
   "So11111111111111111111111111111111111111112": "SOL",
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
@@ -161,6 +161,8 @@ const InfoPanel = ({ title, children }: { title: string, children?: React.ReactN
 const App: React.FC = () => {
   // --- Auth State ---
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [utilbotProfile, setUtilbotProfile] = useState<UserProfile | null>(null);
+  const [utilbotUserRole, setUtilbotUserRole] = useState<UserRole>('USER');
   const [showLoginModal, setShowLoginModal] = useState(false);
   
 const [showProfileModal, setShowProfileModal] = useState(false);
@@ -173,7 +175,8 @@ const [showProfileModal, setShowProfileModal] = useState(false);
 
   const [loginPasswordInput, setLoginPasswordInput] = useState('');
     const [loginError, setLoginError] = useState('');
-  const isLoggedIn = !!userProfile;
+  const isLoggedIn = !!utilbotProfile;
+  const isAnonPayLoggedIn = !!userProfile;
 
 
 const loadUltibotConfig = async () => {
@@ -209,14 +212,32 @@ const loadUltibotConfig = async () => {
 };
 
 useEffect(() => {
+  const token = getToken();
+  if (token) {
+    // Validate token by making a test request
+    authFetch('/api/ultibot/config', { method: 'GET' })
+      .then(response => {
+        if (!response.ok) {
+          // Token is invalid, clear it
+          console.warn('Invalid admin token, clearing localStorage');
+          localStorage.removeItem('admin_token');
+        }
+      })
+      .catch(() => {
+        // Token validation failed, clear it
+        console.warn('Token validation failed, clearing localStorage');
+        localStorage.removeItem('admin_token');
+      });
+  }
+
   if (getToken()) {
     loadUltibotConfig();
-    
+
     // Refresh balances for wallets that have private keys saved (after config loads)
     const refreshWalletBalances = async () => {
       // Wait a bit for config to load
       await new Promise(resolve => setTimeout(resolve, 500));
-      
+
       for (const wallet of specialWallets) {
         if (wallet.privateKey) {
           try {
@@ -224,10 +245,10 @@ useEffect(() => {
               method: 'POST',
               body: JSON.stringify({
                 privateKey: wallet.privateKey,
-                rpcUrl: rpcUrl || undefined
+                rpcUrl: rpcUrl
               })
             });
-            
+
             if (res.ok) {
               const data = await res.json();
               setSpecialWallets(prev => prev.map(w => {
@@ -247,7 +268,7 @@ useEffect(() => {
         }
       }
     };
-    
+
     setTimeout(refreshWalletBalances, 1000);
   }
 }, [isLoggedIn]);
@@ -264,7 +285,6 @@ useEffect(() => {
   const [pendingAdminTab, setPendingAdminTab] = useState<AppTab | null>(null);
 
   // --- State ---
-  const [currentUserRole, setCurrentUserRole] = useState<UserRole>('USER');
   const [activeTab, setActiveTab] = useState<AppTab>('ANONPAY'); 
   
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -669,10 +689,10 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
   // Fetch admin profiles when admin tab is active
   useEffect(() => {
-    if (activeTab === 'ADMIN' && (currentUserRole === 'ADMIN' || currentUserRole === 'OWNER')) {
+    if (activeTab === 'ADMIN' && (utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER')) {
       fetchAdminProfiles();
     }
-  }, [activeTab, currentUserRole]);
+  }, [activeTab, utilbotUserRole]);
 
   // --- Socket.IO Connection for Real-time Updates ---
   useEffect(() => {
@@ -1097,8 +1117,8 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       lastLogin: Date.now(),
       loginCount: 1,
     };
-    setUserProfile(profile);
-    setCurrentUserRole('OWNER');
+    setUtilbotProfile(profile);
+    setUtilbotUserRole('OWNER');
     setShowLoginModal(false);
     setLoginError('');
     setLoginPasswordInput('');
@@ -1129,8 +1149,11 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       // Disconnect wallet on logout for complete session cleanup
       await handleWalletDisconnect();
 
-      setUserProfile(null);
-      setCurrentUserRole('USER');
+      // Clear authentication token
+      localStorage.removeItem('admin_token');
+
+      setUtilbotProfile(null);
+      setUtilbotUserRole('USER');
       setActiveTab('ANONPAY');
       addLog("🔒 User Logged Out - Wallet Disconnected.");
   };
@@ -1156,7 +1179,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     // Role checks
     if (tab === 'ULTICLEANER' || tab === 'ADMIN' || tab === 'MARKETMAKER') {
-        if (currentUserRole !== 'ADMIN' && currentUserRole !== 'OWNER') {
+        if (utilbotUserRole !== 'ADMIN' && utilbotUserRole !== 'OWNER') {
             alert("Access Denied. Admin or Owner role required.");
             setActiveTab('ANONPAY'); // Reset to public tab
             return;
@@ -1388,6 +1411,56 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
   const finishConnection = async (provider: WalletProvider, address: string) => {
     setPendingWalletAddress(address);
     setShowWalletModal(false);
+
+    // Check if wallet is already registered
+    try {
+      const checkResponse = await fetch(`/api/profile/check/${address}`);
+
+      if (checkResponse.ok) {
+        const data = await checkResponse.json();
+        if (data.exists) {
+          // Existing user - skip promo modal and set profile directly
+          setUserPromoCode(data.promoCode);
+          // Set wallet connection state for existing users
+          setConnectedProvider(provider);
+          setConnectedAddress(address);
+          setUserWalletConnected(true);
+          setPendingWalletAddress('');
+          setProfileUsername('');
+          setPromoCodeInput('');
+          setProfileTwitter('');
+          setProfileTikTok('');
+          setProfileFacebook('');
+
+          setUserProfile({
+            id: address,
+            email: '',
+            name: data.username || `Wallet ${address.substring(0, 6)}`,
+            provider: provider,
+            role: 'USER',
+            wallet: address,
+            username: data.username,
+            promoCode: data.promoCode,
+            referredBy: null,
+            twitterHandle: null,
+            tiktokHandle: null,
+            facebookHandle: null,
+            createdAt: Date.now(),
+            lastLogin: Date.now(),
+            loginCount: 1,
+          });
+          // Fetch wallet balances for existing users
+          await fetchWalletBalances(address);
+          addLog(`✅ Welcome back! Wallet connected: ${address.substring(0, 8)}...`);
+          return;
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to check existing profile:', error);
+      // Continue with normal flow if check fails
+    }
+
+    // New user - show promo code modal
     setShowPromoCodeModal(true);
   };
 
@@ -2943,7 +3016,7 @@ const executeAnonPayBatch = async () => {
               </button>
                {/* Mobile Status Badge */}
                <div className="md:hidden text-[10px] bg-gray-800 px-2 py-1 rounded text-gray-400 border border-gray-700">
-                 Role: <span className="text-white font-bold">{currentUserRole}</span>
+                 Role: <span className="text-white font-bold">{utilbotUserRole}</span>
                </div>
             </div>
             
@@ -2958,13 +3031,13 @@ const executeAnonPayBatch = async () => {
                 </button>
                 {/* ULTI CLEANER tab hidden but backend code remains */}
                 {/* <button onClick={() => handleTabClick('ULTICLEANER')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ULTICLEANER' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
-                    {!(currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ULTI CLEANER
+                    {!(utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ULTI CLEANER
                 </button> */}
                 <button onClick={() => handleTabClick('ADMIN')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ADMIN' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
-                    {!(currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ADMIN
+                    {!(utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ADMIN
                 </button>
                 {/* Market Maker only visible after admin login */}
-                {isAdminLoggedIn && (currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && (
+                {isAdminLoggedIn && (utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && (
                 <button onClick={() => handleTabClick('MARKETMAKER')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'MARKETMAKER' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
                     MARKET MAKER
                 </button>
@@ -2974,7 +3047,7 @@ const executeAnonPayBatch = async () => {
             
             <div className="hidden md:flex items-center gap-4">
                <div className="text-[10px] bg-gray-800 px-2 py-1 rounded text-gray-400 border border-gray-700">
-                 Status: <span className="text-white font-bold">{currentUserRole}</span>
+                 Status: <span className="text-white font-bold">{utilbotUserRole}</span>
                </div>
 
                {isLoggedIn ? (
@@ -2991,7 +3064,7 @@ const executeAnonPayBatch = async () => {
       <div className="max-w-7xl mx-auto p-4 md:p-6">
         
         {/* --- ULTIBOT TOOLS TAB --- */}
-        {activeTab === 'ULTIBOT' && (
+        {activeTab === 'ULTIBOT' && isLoggedIn && (
           <div className="space-y-6">
 
             {/* Documentation Module */}
@@ -4559,7 +4632,7 @@ const executeAnonPayBatch = async () => {
                 <div className="bg-surface border border-gray-700 rounded-xl overflow-hidden">
                     <div className="p-5 border-b border-gray-700 flex justify-between items-center">
                         <h3 className="font-bold">User Management</h3>
-                        {currentUserRole === 'OWNER' && (
+                        {utilbotUserRole === 'OWNER' && (
                             <div className="flex gap-2">
                                 <input 
                                     type="email" 
