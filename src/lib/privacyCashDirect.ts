@@ -122,8 +122,8 @@ export class PrivacyCashDirect {
       const message = new TextEncoder().encode('Privacy Cash encryption key derivation');
       const signedMessage = await this.wallet.signMessage(message);
       
-      // Derive encryption key from signature
-      this.encryptionService.deriveEncryptionKeyFromSignature(signedMessage.signature);
+      // Derive encryption key from signature (now async)
+      await this.encryptionService.deriveEncryptionKeyFromSignature(signedMessage.signature);
 
       this.initialized = true;
       logger.info('Privacy Cash initialized successfully');

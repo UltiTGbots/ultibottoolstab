@@ -31,13 +31,15 @@ export default defineConfig(({ mode }) => {
     define: {
       global: "globalThis",
       process: {
-        env: {},
+        env: {
+          VITE_API_BASE_URL: JSON.stringify(env.VITE_API_BASE_URL || 'http://3.21.170.124:8787'),
+          VITE_SOCKET_BASE_URL: JSON.stringify(env.VITE_SOCKET_BASE_URL || env.VITE_API_BASE_URL || 'http://3.21.170.124:8787'),
+          GEMINI_API_KEY: JSON.stringify(env.GEMINI_API_KEY || ''),
+          API_KEY: JSON.stringify(env.GEMINI_API_KEY || ''),
+        },
         browser: true,
         version: "v0.0.0",
       },
-
-      "process.env.GEMINI_API_KEY": JSON.stringify(env.GEMINI_API_KEY),
-      "process.env.API_KEY": JSON.stringify(env.GEMINI_API_KEY),
     },
 
     resolve: {

@@ -7,12 +7,109 @@
 
 import BN from 'bn.js';
 import { Utxo } from '../models/utxo.js';
-import * as borsh from 'borsh';
 import { sha256 } from '@ethersproject/sha2';
 import { PublicKey } from '@solana/web3.js';
 import { RELAYER_API_URL, PROGRAM_ID } from './constants.js';
 import { logger } from './logger.js';
 import { getConfig } from '../src/config.js';
+
+/**
+ * Browser-compatible Borsh serialization
+ * Manually serializes data according to Borsh format
+ */
+function serializeBorsh(schema: any, value: any): Buffer {
+  const buffers: Buffer[] = [];
+  
+  function serializeValue(fieldSchema: any, fieldValue: any) {
+    if (typeof fieldSchema === 'string') {
+      // Primitive type
+      if (fieldSchema === 'i64' || fieldSchema === 'u64') {
+        // BN instance - serialize as little-endian 8-byte integer
+        const bn = fieldValue instanceof BN ? fieldValue : new BN(fieldValue.toString());
+        const buffer = Buffer.allocUnsafe(8);
+        if (fieldSchema === 'i64') {
+          // Signed 64-bit integer (two's complement)
+          const isNegative = bn.isNeg();
+          const absValue = bn.abs();
+          for (let i = 0; i < 8; i++) {
+            buffer[i] = (absValue.shrn(i * 8).toNumber() & 0xff);
+          }
+          if (isNegative) {
+            // Two's complement for negative numbers
+            let carry = 1;
+            for (let i = 0; i < 8; i++) {
+              const byte = (~buffer[i] & 0xff) + carry;
+              buffer[i] = byte & 0xff;
+              carry = byte >> 8;
+            }
+          }
+        } else {
+          // Unsigned 64-bit integer
+          for (let i = 0; i < 8; i++) {
+            buffer[i] = (bn.shrn(i * 8).toNumber() & 0xff);
+          }
+        }
+        buffers.push(buffer);
+      } else if (fieldSchema === 'u8') {
+        buffers.push(Buffer.from([fieldValue & 0xff]));
+      } else if (fieldSchema === 'u16') {
+        const buffer = Buffer.allocUnsafe(2);
+        buffer.writeUInt16LE(fieldValue, 0);
+        buffers.push(buffer);
+      } else if (fieldSchema === 'u32') {
+        const buffer = Buffer.allocUnsafe(4);
+        buffer.writeUInt32LE(fieldValue, 0);
+        buffers.push(buffer);
+      }
+    } else if (fieldSchema && fieldSchema.array) {
+      // Array type
+      if (fieldSchema.array.len !== undefined) {
+        // Fixed-length array
+        if (fieldSchema.array.type === 'u8') {
+          // For u8 arrays, directly use the buffer/bytes
+          const buffer = Buffer.isBuffer(fieldValue) ? fieldValue :
+                        fieldValue instanceof Uint8Array ? Buffer.from(fieldValue) :
+                        Buffer.from(fieldValue);
+          // Ensure it's exactly the required length
+          if (buffer.length !== fieldSchema.array.len) {
+            const padded = Buffer.alloc(fieldSchema.array.len);
+            buffer.copy(padded, 0, 0, Math.min(buffer.length, fieldSchema.array.len));
+            buffers.push(padded);
+          } else {
+            buffers.push(buffer);
+          }
+        } else {
+          // For other types, serialize each element
+          const arr = Array.isArray(fieldValue) ? fieldValue : Array.from(fieldValue);
+          for (let i = 0; i < fieldSchema.array.len; i++) {
+            serializeValue(fieldSchema.array.type, arr[i] || 0);
+          }
+        }
+      } else {
+        // Variable-length array - write length first (u32)
+        const arr = Buffer.isBuffer(fieldValue) ? Array.from(fieldValue) : 
+                   Array.isArray(fieldValue) ? fieldValue : 
+                   fieldValue instanceof Uint8Array ? Array.from(fieldValue) :
+                   Array.from(fieldValue);
+        const lenBuffer = Buffer.allocUnsafe(4);
+        lenBuffer.writeUInt32LE(arr.length, 0);
+        buffers.push(lenBuffer);
+        for (const item of arr) {
+          serializeValue(fieldSchema.array.type, item);
+        }
+      }
+    }
+  }
+  
+  // Serialize struct fields in order
+  if (schema.struct) {
+    for (const [fieldName, fieldSchema] of Object.entries(schema.struct)) {
+      serializeValue(fieldSchema, value[fieldName]);
+    }
+  }
+  
+  return Buffer.concat(buffers);
+}
 
 /**
  * Calculate deposit fee based on deposit amount and fee rate
@@ -104,8 +201,8 @@ export function getExtDataHash(extData: {
     mintAddress: mintAddress.toBytes(),
   };
 
-  // Serialize with Borsh
-  const serializedData = borsh.serialize(schema, value);
+  // Serialize with browser-compatible Borsh
+  const serializedData = serializeBorsh(schema, value);
 
   // Calculate the SHA-256 hash
   const hashHex = sha256(serializedData);

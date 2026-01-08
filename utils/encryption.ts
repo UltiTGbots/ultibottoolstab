@@ -1,12 +1,199 @@
 import { Keypair, PublicKey } from '@solana/web3.js';
 import nacl from 'tweetnacl';
-import * as crypto from 'crypto';
 import { Utxo } from '../models/utxo.js';
 import { WasmFactory } from '@lightprotocol/hasher.rs';
 import { Keypair as UtxoKeypair } from '../models/keypair.js';
 import { keccak256 } from '@ethersproject/keccak256';
 import { PROGRAM_ID, TRANSACT_IX_DISCRIMINATOR, TRANSACT_SPL_IX_DISCRIMINATOR } from './constants.js';
 import BN from 'bn.js';
+
+/**
+ * Browser-compatible crypto utilities using Web Crypto API
+ */
+const browserCrypto = {
+  /**
+   * Create SHA-256 hash (browser-compatible)
+   */
+  async createHash(algorithm: string, data: Uint8Array): Promise<Uint8Array> {
+    if (algorithm !== 'sha256') {
+      throw new Error(`Unsupported algorithm: ${algorithm}`);
+    }
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return new Uint8Array(hashBuffer);
+  },
+
+  /**
+   * Generate random bytes (browser-compatible)
+   */
+  randomBytes(length: number): Uint8Array {
+    const array = new Uint8Array(length);
+    crypto.getRandomValues(array);
+    return array;
+  },
+
+  /**
+   * Create HMAC (browser-compatible)
+   */
+  async createHmac(algorithm: string, key: Uint8Array): Promise<{
+    update: (data: Uint8Array) => any;
+    digest: () => Promise<Uint8Array>;
+  }> {
+    if (algorithm !== 'sha256') {
+      throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
+    }
+    
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      key,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    let dataToSign: Uint8Array[] = [];
+
+    const hmacObject = {
+      update: (data: Uint8Array) => {
+        dataToSign.push(data);
+        return hmacObject; // Return self for chaining
+      },
+      digest: async () => {
+        const combined = new Uint8Array(dataToSign.reduce((acc, arr) => acc + arr.length, 0));
+        let offset = 0;
+        for (const arr of dataToSign) {
+          combined.set(arr, offset);
+          offset += arr.length;
+        }
+        const signature = await crypto.subtle.sign('HMAC', cryptoKey, combined);
+        return new Uint8Array(signature);
+      }
+    };
+
+    return hmacObject;
+  },
+
+  /**
+   * Create cipher for encryption (browser-compatible)
+   */
+  async createCipheriv(algorithm: string, key: Uint8Array, iv: Uint8Array): Promise<{
+    update: (data: Uint8Array) => void;
+    final: () => Promise<Uint8Array>;
+    getAuthTag: () => Uint8Array;
+  }> {
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      key,
+      { name: algorithm === 'aes-256-gcm' ? 'AES-GCM' : 'AES-CTR', length: key.length * 8 },
+      false,
+      ['encrypt']
+    );
+
+    let encryptedData: Uint8Array[] = [];
+    let authTag: Uint8Array | null = null;
+
+    return {
+      update: (data: Uint8Array) => {
+        encryptedData.push(data);
+      },
+      final: async () => {
+        const combined = new Uint8Array(encryptedData.reduce((acc, arr) => acc + arr.length, 0));
+        let offset = 0;
+        for (const arr of encryptedData) {
+          combined.set(arr, offset);
+          offset += arr.length;
+        }
+
+        if (algorithm === 'aes-256-gcm') {
+          const encrypted = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            cryptoKey,
+            combined
+          );
+          const encryptedArray = new Uint8Array(encrypted);
+          // GCM auth tag is appended to the encrypted data
+          authTag = encryptedArray.slice(-16);
+          return encryptedArray.slice(0, -16);
+        } else {
+          // AES-CTR
+          const encrypted = await crypto.subtle.encrypt(
+            { name: 'AES-CTR', counter: iv, length: 128 },
+            cryptoKey,
+            combined
+          );
+          return new Uint8Array(encrypted);
+        }
+      },
+      getAuthTag: () => {
+        if (!authTag) {
+          throw new Error('Auth tag not available');
+        }
+        return authTag;
+      }
+    };
+  },
+
+  /**
+   * Create decipher for decryption (browser-compatible)
+   */
+  async createDecipheriv(algorithm: string, key: Uint8Array, iv: Uint8Array): Promise<{
+    update: (data: Uint8Array) => void;
+    final: () => Promise<Uint8Array>;
+    setAuthTag: (tag: Uint8Array) => void;
+  }> {
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      key,
+      { name: algorithm === 'aes-256-gcm' ? 'AES-GCM' : 'AES-CTR', length: key.length * 8 },
+      false,
+      ['decrypt']
+    );
+
+    let encryptedData: Uint8Array[] = [];
+    let authTag: Uint8Array | null = null;
+
+    return {
+      update: (data: Uint8Array) => {
+        encryptedData.push(data);
+      },
+      final: async () => {
+        const combined = new Uint8Array(encryptedData.reduce((acc, arr) => acc + arr.length, 0));
+        let offset = 0;
+        for (const arr of encryptedData) {
+          combined.set(arr, offset);
+          offset += arr.length;
+        }
+
+        if (algorithm === 'aes-256-gcm') {
+          if (!authTag) {
+            throw new Error('Auth tag must be set before final()');
+          }
+          // Combine encrypted data with auth tag for GCM
+          const encryptedWithTag = new Uint8Array(combined.length + authTag.length);
+          encryptedWithTag.set(combined, 0);
+          encryptedWithTag.set(authTag, combined.length);
+          
+          const decrypted = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv },
+            cryptoKey,
+            encryptedWithTag
+          );
+          return new Uint8Array(decrypted);
+        } else {
+          // AES-CTR
+          const decrypted = await crypto.subtle.decrypt(
+            { name: 'AES-CTR', counter: iv, length: 128 },
+            cryptoKey,
+            combined
+          );
+          return new Uint8Array(decrypted);
+        }
+      },
+      setAuthTag: (tag: Uint8Array) => {
+        authTag = tag;
+      }
+    };
+  }
+};
 
 
 /**
@@ -41,7 +228,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
  * @param signature The user's signature
  * @returns The generated encryption key
  */
-  public deriveEncryptionKeyFromSignature(signature: Uint8Array): EncryptionKey {
+  public async deriveEncryptionKeyFromSignature(signature: Uint8Array): Promise<EncryptionKey> {
     // Extract the first 31 bytes of the signature to create a deterministic key (legacy method)
     const encryptionKeyV1 = signature.slice(0, 31);
 
@@ -49,8 +236,8 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     this.encryptionKeyV1 = encryptionKeyV1;
 
     // Precompute and cache the UTXO private key
-    const hashedSeedV1 = crypto.createHash('sha256').update(encryptionKeyV1).digest();
-    this.utxoPrivateKeyV1 = '0x' + hashedSeedV1.toString('hex');
+    const hashedSeedV1 = await browserCrypto.createHash('sha256', encryptionKeyV1);
+    this.utxoPrivateKeyV1 = '0x' + Buffer.from(hashedSeedV1).toString('hex');
 
     // Use Keccak256 to derive a full 32-byte encryption key from the signature
     const encryptionKeyV2 = Buffer.from(keccak256(signature).slice(2), 'hex');
@@ -74,11 +261,11 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @param keypair The Solana keypair to derive the encryption key from
    * @returns The generated encryption key
    */
-  public deriveEncryptionKeyFromWallet(keypair: Keypair): EncryptionKey {
+  public async deriveEncryptionKeyFromWallet(keypair: Keypair): Promise<EncryptionKey> {
     // Sign a constant message with the keypair
     const message = Buffer.from('Privacy Money account sign in');
     const signature = nacl.sign.detached(message, keypair.secretKey);
-    return this.deriveEncryptionKeyFromSignature(signature)
+    return await this.deriveEncryptionKeyFromSignature(signature)
   }
 
   /**
@@ -87,7 +274,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @returns The encrypted data as a Buffer
    * @throws Error if the encryption key has not been generated
    */
-  public encrypt(data: Buffer | string): Buffer {
+  public async encrypt(data: Buffer | string): Promise<Buffer> {
     if (!this.encryptionKeyV2) {
       throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
     }
@@ -96,17 +283,15 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     const dataBuffer = typeof data === 'string' ? Buffer.from(data) : data;
 
     // Generate a standard initialization vector (12 bytes for GCM)
-    const iv = crypto.randomBytes(12);
+    const iv = browserCrypto.randomBytes(12);
 
     // Use the full 32-byte V2 encryption key for AES-256
     const key = Buffer.from(this.encryptionKeyV2);
 
     // Use AES-256-GCM for authenticated encryption
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    const encryptedData = Buffer.concat([
-      cipher.update(dataBuffer),
-      cipher.final()
-    ]);
+    const cipher = await browserCrypto.createCipheriv('aes-256-gcm', new Uint8Array(key), iv);
+    cipher.update(new Uint8Array(dataBuffer));
+    const encryptedData = await cipher.final();
 
     // Get the authentication tag from GCM (16 bytes)
     const authTag = cipher.getAuthTag();
@@ -114,14 +299,14 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     // Version 2 format: [version(8)] + [IV(12)] + [authTag(16)] + [encryptedData]
     return Buffer.concat([
       EncryptionService.ENCRYPTION_VERSION_V2,
-      iv,
-      authTag,
-      encryptedData
+      Buffer.from(iv),
+      Buffer.from(authTag),
+      Buffer.from(encryptedData)
     ]);
   }
 
   // v1 encryption, only used for testing now
-  public encryptDecryptedDoNotUse(data: Buffer | string): Buffer {
+  public async encryptDecryptedDoNotUse(data: Buffer | string): Promise<Buffer> {
     if (!this.encryptionKeyV1) {
       throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
     }
@@ -130,27 +315,25 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     const dataBuffer = typeof data === 'string' ? Buffer.from(data) : data;
 
     // Generate a standard initialization vector (16 bytes)
-    const iv = crypto.randomBytes(16);
+    const iv = browserCrypto.randomBytes(16);
 
     // Create a key from our encryption key (using only first 16 bytes for AES-128)
     const key = Buffer.from(this.encryptionKeyV1).slice(0, 16);
 
     // Use a more compact encryption algorithm (aes-128-ctr)
-    const cipher = crypto.createCipheriv('aes-128-ctr', key, iv);
-    const encryptedData = Buffer.concat([
-      cipher.update(dataBuffer),
-      cipher.final()
-    ]);
+    const cipher = await browserCrypto.createCipheriv('aes-128-ctr', new Uint8Array(key), iv);
+    cipher.update(new Uint8Array(dataBuffer));
+    const encryptedData = await cipher.final();
 
     // Create an authentication tag (HMAC) to verify decryption with correct key
     const hmacKey = Buffer.from(this.encryptionKeyV1).slice(16, 31);
-    const hmac = crypto.createHmac('sha256', hmacKey);
-    hmac.update(iv);
-    hmac.update(encryptedData);
-    const authTag = hmac.digest().slice(0, 16); // Use first 16 bytes of HMAC as auth tag
+    const hmac = await browserCrypto.createHmac('sha256', new Uint8Array(hmacKey));
+    hmac.update(new Uint8Array(iv));
+    hmac.update(new Uint8Array(encryptedData));
+    const authTag = (await hmac.digest()).slice(0, 16); // Use first 16 bytes of HMAC as auth tag
 
     // Combine IV, auth tag and encrypted data
-    return Buffer.concat([iv, authTag, encryptedData]);
+    return Buffer.concat([Buffer.from(iv), Buffer.from(authTag), Buffer.from(encryptedData)]);
   }
 
   /**
@@ -159,19 +342,19 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @returns The decrypted data as a Buffer
    * @throws Error if the encryption key has not been generated or if the wrong key is used
    */
-  public decrypt(encryptedData: Buffer): Buffer {
+  public async decrypt(encryptedData: Buffer): Promise<Buffer> {
     // Check if this is the new version format (starts with 8-byte version identifier)
     if (encryptedData.length >= 8 && encryptedData.subarray(0, 8).equals(EncryptionService.ENCRYPTION_VERSION_V2)) {
       if (!this.encryptionKeyV2) {
         throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
       }
-      return this.decryptV2(encryptedData);
+      return await this.decryptV2(encryptedData);
     } else {
       // V1 format - need V1 key or keypair to derive it
       if (!this.encryptionKeyV1) {
         throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
       }
-      return this.decryptV1(encryptedData);
+      return await this.decryptV1(encryptedData);
     }
   }
 
@@ -181,7 +364,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @param keypair Optional keypair to derive V1 key for backward compatibility
    * @returns The decrypted data as a Buffer
    */
-  private decryptV1(encryptedData: Buffer): Buffer {
+  private async decryptV1(encryptedData: Buffer): Promise<Buffer> {
     if (!this.encryptionKeyV1) {
       throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
     }
@@ -195,13 +378,13 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
 
     // Verify the authentication tag
     const hmacKey = Buffer.from(this.encryptionKeyV1).slice(16, 31);
-    const hmac = crypto.createHmac('sha256', hmacKey);
-    hmac.update(iv);
-    hmac.update(data);
-    const calculatedTag = hmac.digest().slice(0, 16);
+    const hmac = await browserCrypto.createHmac('sha256', new Uint8Array(hmacKey));
+    hmac.update(new Uint8Array(iv));
+    hmac.update(new Uint8Array(data));
+    const calculatedTag = (await hmac.digest()).slice(0, 16);
 
     // Compare tags - if they don't match, the key is wrong
-    if (!this.timingSafeEqual(authTag, calculatedTag)) {
+    if (!this.timingSafeEqual(new Uint8Array(authTag), calculatedTag)) {
       throw new Error('Failed to decrypt data. Invalid encryption key or corrupted data.');
     }
 
@@ -209,13 +392,12 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     const key = Buffer.from(this.encryptionKeyV1).slice(0, 16);
 
     // Use the same algorithm as in encrypt
-    const decipher = crypto.createDecipheriv('aes-128-ctr', key, iv);
+    const decipher = await browserCrypto.createDecipheriv('aes-128-ctr', new Uint8Array(key), new Uint8Array(iv));
 
     try {
-      return Buffer.concat([
-        decipher.update(data),
-        decipher.final()
-      ]);
+      decipher.update(new Uint8Array(data));
+      const decrypted = await decipher.final();
+      return Buffer.from(decrypted);
     } catch (error) {
       throw new Error('Failed to decrypt data. Invalid encryption key or corrupted data.');
     }
@@ -238,7 +420,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @param encryptedData The encrypted data to decrypt
    * @returns The decrypted data as a Buffer
    */
-  private decryptV2(encryptedData: Buffer): Buffer {
+  private async decryptV2(encryptedData: Buffer): Promise<Buffer> {
     if (!this.encryptionKeyV2) {
       throw new Error('encryptionKeyV2 not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
     }
@@ -252,14 +434,13 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     const key = Buffer.from(this.encryptionKeyV2!);
 
     // Use AES-256-GCM for authenticated decryption
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(authTag);
+    const decipher = await browserCrypto.createDecipheriv('aes-256-gcm', new Uint8Array(key), new Uint8Array(iv));
+    decipher.setAuthTag(new Uint8Array(authTag));
 
     try {
-      return Buffer.concat([
-        decipher.update(data),
-        decipher.final()
-      ]);
+      decipher.update(new Uint8Array(data));
+      const decrypted = await decipher.final();
+      return Buffer.from(decrypted);
     } catch (error) {
       throw new Error('Failed to decrypt data. Invalid encryption key or corrupted data.');
     }
@@ -282,7 +463,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
    * @returns The encrypted UTXO data as a Buffer
    * @throws Error if the V2 encryption key has not been set
    */
-  public encryptUtxo(utxo: Utxo): Buffer {
+  public async encryptUtxo(utxo: Utxo): Promise<Buffer> {
     if (!this.encryptionKeyV2) {
       throw new Error('Encryption key not set. Call setEncryptionKey or deriveEncryptionKeyFromWallet first.');
     }
@@ -292,7 +473,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
     const utxoString = `${utxo.amount.toString()}|${utxo.blinding.toString()}|${utxo.index}|${utxo.mintAddress}`;
 
     // Always use V2 encryption format (which adds version byte 0x02 at the beginning)
-    return this.encrypt(utxoString);
+    return await this.encrypt(utxoString);
   }
 
   // Deprecated, only used for testing now
@@ -342,7 +523,7 @@ export class EncryptionService {// Version identifier for encryption scheme (8-b
 
     // The decrypt() method already handles encryption format version detection (V1 vs V2)
     // It checks the first byte to determine whether to use decryptV1() or decryptV2()
-    const decrypted = this.decrypt(encryptedBuffer);
+    const decrypted = await this.decrypt(encryptedBuffer);
 
     // Parse the pipe-delimited format: amount|blinding|index|mintAddress
     const decryptedStr = decrypted.toString();

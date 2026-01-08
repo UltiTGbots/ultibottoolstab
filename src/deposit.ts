@@ -254,8 +254,8 @@ export async function deposit({ lightWasm, storage, keyBasePath, publicKey, conn
 
     // Encrypt the UTXO data using a compact format that includes the keypair
     logger.debug('\nEncrypting UTXOs with keypair data...');
-    const encryptedOutput1 = encryptionService.encryptUtxo(outputs[0]);
-    const encryptedOutput2 = encryptionService.encryptUtxo(outputs[1]);
+    const encryptedOutput1 = await encryptionService.encryptUtxo(outputs[0]);
+    const encryptedOutput2 = await encryptionService.encryptUtxo(outputs[1]);
 
     logger.debug(`\nOutput[0] (with value):`);
     await outputs[0].log();

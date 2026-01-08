@@ -58,19 +58,7 @@ const PORT = Number(process.env.PORT || 8787);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
 
 const app = express();
-app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:8787",
-    "https://ultibottoolstab.vercel.app",
-    "https://ultibots.xyz",
-    /\.vercel\.app$/,
-    /\.now\.sh$/,
-    /\.vercel-preview\.app$/
-  ],
-  credentials: true
-}));
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
 const httpServer = createServer(app);
@@ -81,17 +69,12 @@ const io = new IOServer(httpServer, {
       "http://localhost:5173",
       "http://localhost:8787",
       "https://ultibottoolstab.vercel.app",
-      "https://ultibots.xyz",
       /\.vercel\.app$/,
       /\.now\.sh$/,
       /\.vercel-preview\.app$/
     ],
-    credentials: true,
-    methods: ["GET", "POST"],
-    allowedHeaders: ["*"]
-  },
-  allowEIO3: true,
-  transports: ['websocket', 'polling']
+    credentials: true
+  }
 });
 
 // --- Admin auth (simple session token) ---
@@ -221,6 +204,7 @@ type BotConfig = {
   buySolPerWalletLamports?: number;
   holderScanIntervalMs?: number;
   holderScanTimeoutMs?: number;
+  usePrivacyMode?: boolean;
 };
 
 let botConfig: BotConfig = loadUltibotConfig(db) as any;
@@ -301,7 +285,7 @@ type TradeEvent = {
 };
 
 async function inferTradeFromTx(signature: string, wallet: string, mint?: string): Promise<TradeEvent | null> {
-  const conn = getConnection();
+  const conn = getConnection(botConfig?.rpcUrl);
   const tx = await conn.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
   if (!tx) return null;
   const meta = tx.meta;
@@ -366,9 +350,9 @@ async function startWalletMonitor(wallet: string) {
   
   try {
     const walletPk = new PublicKey(wallet);
+    const conn = getConnection(botConfig?.rpcUrl);
 
     // "mentions" subscription: gets logs where this pubkey is mentioned
-    const conn = getConnection();
     const subId = conn.onLogs(walletPk, async (logs: any) => {
       try {
         if (!botConfig.enabled) return;
@@ -395,7 +379,7 @@ async function startWalletMonitor(wallet: string) {
 async function stopWalletMonitor(wallet: string) {
   const sub = monitoredWalletSubscriptions.get(wallet);
   if (!sub) return;
-  const conn = getConnection();
+  const conn = getConnection(botConfig?.rpcUrl);
   await conn.removeOnLogsListener(sub);
   monitoredWalletSubscriptions.delete(wallet);
 }
@@ -891,6 +875,7 @@ app.get('/api/profile/check/:wallet', (req, res) => {
     facebookHandle: existing.facebook_handle
   });
 });
+
 app.post('/api/profile/connect', (req, res) => {
   const Schema = z.object({
     wallet: z.string().min(1),
@@ -1395,8 +1380,8 @@ app.get('/api/solana/token-info', requireAdmin, async (req, res) => {
           };
         }
       }
-    } catch (metadataError: any) {
-      console.warn('Failed to fetch token metadata:', metadataError?.message || metadataError);
+    } catch (metadataError: unknown) {
+      console.warn('Failed to fetch token metadata:', metadataError instanceof Error ? metadataError.message : String(metadataError));
       // Continue without metadata
     }
 
@@ -1574,7 +1559,7 @@ setInterval(async () => {
       io.emit('server_error', { message: String(e) });
     }
   }
-}, 60000); // Increased to 60s to reduce RPC load and rate limiting
+}, 30000); // Increased to 30s to further reduce RPC load
 
 /**
  * Market Maker API Endpoints
@@ -2044,21 +2029,23 @@ app.post('/api/admin/fees', (req, res) => {
 app.get('/api/marketmaker/stats', async (_req, res) => {
   try {
     if (!mmConfig || !mmConfig.tokenMint) {
+      // Get active wallets count from database
+      const activeWalletsCount = db.prepare('SELECT COUNT(*) as count FROM market_maker_wallets WHERE balance_sol > 0').get() as { count: number };
       return res.json({
         totalTrades: 0,
         totalVolume: 0,
         totalProfit: 0,
-        activeWallets: 0,
+        activeWallets: activeWalletsCount.count,
         currentPrice: 0,
         unwhitelistedHoldingsPct: 0,
       });
     }
-
+    
     const metrics = await computeUnwhitelistedPct(mmConfig.tokenMint, mmConfig.whitelist);
-
+    
     // Get active wallets count from database
     const activeWalletsCount = db.prepare('SELECT COUNT(*) as count FROM market_maker_wallets WHERE balance_sol > 0').get() as { count: number };
-
+    
     res.json({
       totalTrades: mmOrders.filter(o => o.status === 'COMPLETED').length,
       totalVolume: mmOrders.reduce((sum, o) => sum + (o.amount || 0), 0),

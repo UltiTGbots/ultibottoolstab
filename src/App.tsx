@@ -26,6 +26,8 @@ import MarketMaker from './components/MarketMaker';
 import { parseWalletCSV, parseAnonPayCSV } from './services/csvService';
 import { AppState, Wallet, WalletGroup, TradeConfig, Transaction, MarketData, SpecialWallet, CyclePhase, StrategyPreset, SpecialRole, StrategyConfig, PrivacyState, PrivacyQueueItem, AppTab, AnonPayRecipient, UserRole, UserProfile, WalletProvider, CleanerDestination, CleanerStage, TokenBalance, PauseMode } from './types';
 import * as solanaWeb3 from "@solana/web3.js";
+import { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
+import nacl from 'tweetnacl';
 import {
   getAssociatedTokenAddress,
   createTransferInstruction,
@@ -48,7 +50,7 @@ const ANON_PAY_FEE_PER_TX = 0.001;
 const FEE_COLLECTOR_WALLET = "OIURTHIU*&5r,a.kea;oijsdpoi]aYTUYQPUHb12";
 const DEFAULT_ACCESS_PASSWORD = "321$nimda"; 
 const DEFAULT_ADMIN_PASSWORD = "321$nimda"; // Known mints for display
-const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';  // Use environment variable or fallback to relative paths
+const API_BASE = '';  // Use relative paths - works on both localhost and production
 const KNOWN_MINTS: Record<string, string> = {
   "So11111111111111111111111111111111111111112": "SOL",
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
@@ -161,8 +163,6 @@ const InfoPanel = ({ title, children }: { title: string, children?: React.ReactN
 const App: React.FC = () => {
   // --- Auth State ---
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [utilbotProfile, setUtilbotProfile] = useState<UserProfile | null>(null);
-  const [utilbotUserRole, setUtilbotUserRole] = useState<UserRole>('USER');
   const [showLoginModal, setShowLoginModal] = useState(false);
   
 const [showProfileModal, setShowProfileModal] = useState(false);
@@ -175,8 +175,7 @@ const [showProfileModal, setShowProfileModal] = useState(false);
 
   const [loginPasswordInput, setLoginPasswordInput] = useState('');
     const [loginError, setLoginError] = useState('');
-  const isLoggedIn = !!utilbotProfile;
-  const isAnonPayLoggedIn = !!userProfile;
+  const isLoggedIn = !!userProfile;
 
 
 const loadUltibotConfig = async () => {
@@ -212,32 +211,14 @@ const loadUltibotConfig = async () => {
 };
 
 useEffect(() => {
-  const token = getToken();
-  if (token) {
-    // Validate token by making a test request
-    authFetch('/api/ultibot/config', { method: 'GET' })
-      .then(response => {
-        if (!response.ok) {
-          // Token is invalid, clear it
-          console.warn('Invalid admin token, clearing localStorage');
-          localStorage.removeItem('admin_token');
-        }
-      })
-      .catch(() => {
-        // Token validation failed, clear it
-        console.warn('Token validation failed, clearing localStorage');
-        localStorage.removeItem('admin_token');
-      });
-  }
-
   if (getToken()) {
     loadUltibotConfig();
-
+    
     // Refresh balances for wallets that have private keys saved (after config loads)
     const refreshWalletBalances = async () => {
       // Wait a bit for config to load
       await new Promise(resolve => setTimeout(resolve, 500));
-
+      
       for (const wallet of specialWallets) {
         if (wallet.privateKey) {
           try {
@@ -245,10 +226,10 @@ useEffect(() => {
               method: 'POST',
               body: JSON.stringify({
                 privateKey: wallet.privateKey,
-                rpcUrl: rpcUrl
+                rpcUrl: rpcUrl || undefined
               })
             });
-
+            
             if (res.ok) {
               const data = await res.json();
               setSpecialWallets(prev => prev.map(w => {
@@ -268,7 +249,7 @@ useEffect(() => {
         }
       }
     };
-
+    
     setTimeout(refreshWalletBalances, 1000);
   }
 }, [isLoggedIn]);
@@ -285,6 +266,7 @@ useEffect(() => {
   const [pendingAdminTab, setPendingAdminTab] = useState<AppTab | null>(null);
 
   // --- State ---
+  const [currentUserRole, setCurrentUserRole] = useState<UserRole>('USER');
   const [activeTab, setActiveTab] = useState<AppTab>('ANONPAY'); 
   
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -396,9 +378,6 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
   const [showPromoCodeModal, setShowPromoCodeModal] = useState(false);
   const [pendingWalletAddress, setPendingWalletAddress] = useState<string>('');
   const [promoCodeInput, setPromoCodeInput] = useState('');
-  // AnonPay Wallet State - NO PERSISTENCE for maximum security
-  // Users must sign to connect wallet on every page load/refresh
-  // This prevents session hijacking and ensures fresh authorization for financial operations
   const [userWalletConnected, setUserWalletConnected] = useState(false);
   const [connectedProvider, setConnectedProvider] = useState<WalletProvider>('NONE');
   const [connectedAddress, setConnectedAddress] = useState<string>('');
@@ -549,34 +528,6 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     }
   }, []);
 
-  // --- AnonPay Security: Force wallet disconnect on page load ---
-  // CRITICAL: Prevents wallet providers from maintaining connections across page refreshes
-  // This ensures users MUST explicitly authorize each session for maximum security
-  useEffect(() => {
-    const forceWalletDisconnect = async () => {
-      try {
-        // Force disconnect Phantom if connected
-        const phantom = (window as any).phantom?.solana || (window as any).solana;
-        if (phantom && phantom.disconnect && phantom.publicKey) {
-          await phantom.disconnect();
-          console.log('🔒 AnonPay Security: Forced Phantom disconnect on page load');
-        }
-
-        // Force disconnect Solflare if connected
-        const solflare = (window as any).solflare;
-        if (solflare && solflare.disconnect && solflare.publicKey) {
-          await solflare.disconnect();
-          console.log('🔒 AnonPay Security: Forced Solflare disconnect on page load');
-        }
-      } catch (e) {
-        console.warn('Wallet disconnect on load warning:', e);
-      }
-    };
-
-    // Disconnect wallets after a short delay to allow them to initialize
-    setTimeout(forceWalletDisconnect, 100);
-  }, []);
-
   // Helper functions for intruder handling (defined early for socket use)
   const randInt = (min: number, max: number) => Math.floor(randRange(min, max+1));
 
@@ -689,27 +640,38 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
   // Fetch admin profiles when admin tab is active
   useEffect(() => {
-    if (activeTab === 'ADMIN' && (utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER')) {
+    if (activeTab === 'ADMIN' && (currentUserRole === 'ADMIN' || currentUserRole === 'OWNER')) {
       fetchAdminProfiles();
     }
-  }, [activeTab, utilbotUserRole]);
+  }, [activeTab, currentUserRole]);
 
   // --- Socket.IO Connection for Real-time Updates ---
   useEffect(() => {
     console.log('Initializing Socket.IO connection...');
-
-    // For production deployments, connect directly to the external server
-    // In development, use the Vite proxy (window.location.origin)
-    const isProduction = window.location.hostname.includes('vercel.app') ||
-                        window.location.hostname.includes('now.sh') ||
-                        window.location.hostname.includes('vercel-preview.app') ||
-                        window.location.hostname === 'ultibots.xyz' ||
-                        window.location.hostname === 'www.ultibots.xyz';
-
-    const serverUrl = isProduction ? 'http://3.21.170.124:8787' : window.location.origin;
-
-    console.log(`Connecting to Socket.IO server: ${serverUrl}`);
-
+    // Get server URL from .env file (process.env) or fallback logic
+    // Priority: VITE_SOCKET_BASE_URL > VITE_API_BASE_URL > localhost detection > window.location.origin
+    const apiBaseUrl = process.env.VITE_API_BASE_URL;
+    const socketBaseUrl = process.env.VITE_SOCKET_BASE_URL;
+    const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    
+    let serverUrl: string;
+    if (socketBaseUrl) {
+      serverUrl = socketBaseUrl;
+    } else if (apiBaseUrl) {
+      serverUrl = apiBaseUrl;
+    } else if (isLocal) {
+      serverUrl = 'http://3.21.170.124:8787';
+    } else {
+      serverUrl = window.location.origin;
+    }
+    
+    console.log(`Connecting to Socket.IO server: ${serverUrl}`, {
+      VITE_API_BASE_URL: apiBaseUrl,
+      VITE_SOCKET_BASE_URL: socketBaseUrl,
+      isLocal,
+      fallback: window.location.origin
+    });
+    
     const socket = socketIOClient(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -731,23 +693,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     socket.on('connect_error', (error) => {
       console.error('Socket.IO connection error:', error);
-      // Only log connection errors if we're not in a reconnecting state to avoid spam
-      if (!socket.connected) {
-        addLog(`🔌 Connection error: ${error.message}`);
-      }
-    });
-
-    socket.on('reconnect_attempt', (attempt) => {
-      console.log(`Socket.IO reconnect attempt ${attempt}`);
-    });
-
-    socket.on('reconnect', (attempt) => {
-      console.log(`Socket.IO reconnected after ${attempt} attempts`);
-      addLog('🔌 Reconnected to server');
-    });
-
-    socket.on('reconnect_error', (error) => {
-      console.error('Socket.IO reconnect error:', error);
+      addLog(`🔌 Connection error: ${error.message}`);
     });
 
     socket.on('unwhitelisted_pct', (data: { unwhitelistedPctTopAccounts: number; ts: number }) => {
@@ -931,14 +877,19 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
         const profitWallet = current.find(w => w.role === 'PROFIT');
         if (profitWallet && profitWallet.privateKey) {
           // Queue transfer from cycle wallet to profit wallet via Shadow Pool
+          // Note: fromWalletId is the cycle wallet ID from backend
+          // The cycle wallet's private key is stored in backend, so we need to
+          // use the FUNDING wallet (which has the private key) as the source
+          // OR the backend should handle this transfer itself
+          // For now, we'll use fromWalletId if available, otherwise use FUNDING role
           queuePrivacyTransfer(
             undefined,
-            undefined, // fromWalletId - will be set by backend
+            data.fromWalletId, // Cycle wallet ID from backend
             'PROFIT',
             undefined,
             data.amountSol,
             2000,
-            data.toWallet
+            data.toWallet || profitWallet.publicKey
           );
           addLog(`💰 Privacy profit transfer queued: ${data.amountSol.toFixed(4)} SOL → Profit Wallet`);
         }
@@ -953,14 +904,15 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
         const fundingWallet = current.find(w => w.role === 'FUNDING');
         if (fundingWallet && fundingWallet.privateKey) {
           // Queue transfer from cycle wallet back to funding wallet via Shadow Pool
+          // Note: fromWalletId is the cycle wallet ID from backend
           queuePrivacyTransfer(
             undefined,
-            undefined, // fromWalletId - will be set by backend
+            data.fromWalletId, // Cycle wallet ID from backend
             'FUNDING',
             undefined,
             data.amountSol,
             2000,
-            data.toWallet
+            data.toWallet || fundingWallet.publicKey
           );
           addLog(`🔄 Privacy funding return queued: ${data.amountSol.toFixed(4)} SOL → Funding Wallet`);
         }
@@ -1126,29 +1078,46 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     }
     const j = await res.json();
     localStorage.setItem('admin_token', j.token);
-    const profile: UserProfile = {
-      id: 'admin',
-      email: 'admin',
-      name: 'Administrator',
-      username: 'admin',
-      provider: 'EMAIL',
-      role: 'OWNER',
-      wallet: '',
-      promoCode: 'ADMIN',
-      referredBy: null,
-      twitterHandle: null,
-      tiktokHandle: null,
-      facebookHandle: null,
-      createdAt: Date.now(),
-      lastLogin: Date.now(),
-      loginCount: 1,
-    };
-    setUtilbotProfile(profile);
-    setUtilbotUserRole('OWNER');
+    
+    // If user already has a profile (from wallet connection), keep it but grant admin access
+    if (userProfile && userProfile.wallet) {
+      // Keep existing profile, just add admin token
+      setCurrentUserRole('OWNER');
+      addLog("🔐 Admin access granted. Token saved.");
+    } else {
+      // No existing profile, create admin profile
+      const profile: UserProfile = {
+        id: 'admin',
+        email: 'admin',
+        name: 'Administrator',
+        username: 'admin',
+        provider: 'EMAIL',
+        role: 'OWNER',
+        wallet: '',
+        promoCode: 'ADMIN',
+        referredBy: null,
+        twitterHandle: null,
+        tiktokHandle: null,
+        facebookHandle: null,
+        createdAt: Date.now(),
+        lastLogin: Date.now(),
+        loginCount: 1,
+      };
+      setUserProfile(profile);
+      setCurrentUserRole('OWNER');
+      addLog("🔐 Authenticated as OWNER.");
+    }
+    
     setShowLoginModal(false);
     setLoginError('');
     setLoginPasswordInput('');
-    addLog("🔐 Authenticated as OWNER.");
+    
+    // If there was a pending tab (like ULTIBOT), switch to it after successful login
+    if (pendingAdminTab) {
+      setActiveTab(pendingAdminTab);
+      setPendingAdminTab(null);
+    }
+    
     // Load server config after login
     loadUltibotConfig();
     // Load wallet groups after login
@@ -1171,17 +1140,12 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           console.error('Logout tracking error:', e);
         }
       }
-
-      // Disconnect wallet on logout for complete session cleanup
-      await handleWalletDisconnect();
-
-      // Clear authentication token
-      localStorage.removeItem('admin_token');
-
-      setUtilbotProfile(null);
-      setUtilbotUserRole('USER');
+      
+      setUserProfile(null);
+      setCurrentUserRole('USER');
       setActiveTab('ANONPAY');
-      addLog("🔒 User Logged Out - Wallet Disconnected.");
+      handleWalletDisconnect(); 
+      addLog("🔒 User Logged Out.");
   };
 
   const navigateToApp = (tab: AppTab) => {
@@ -1196,6 +1160,18 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
         return;
     }
 
+    // ULTIBOT always requires password login every time (separate from wallet login)
+    if (tab === 'ULTIBOT') {
+        // Always require password login for ULTIBOT, regardless of token or wallet connection
+        // Clear any existing token to force fresh login
+        localStorage.removeItem('admin_token');
+        // Don't set activeTab yet - only set it after successful login
+        // Store the intended tab in pendingAdminTab
+        setPendingAdminTab(tab);
+        setShowLoginModal(true);
+        return;
+    }
+
     // Restricted Tabs - check login first, don't set tab yet
     if (!isLoggedIn) {
         setActiveTab(tab); // Set tab so login modal knows where to go
@@ -1205,24 +1181,15 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     // Role checks
     if (tab === 'ULTICLEANER' || tab === 'ADMIN' || tab === 'MARKETMAKER') {
-        if (utilbotUserRole !== 'ADMIN' && utilbotUserRole !== 'OWNER') {
+        if (currentUserRole !== 'ADMIN' && currentUserRole !== 'OWNER') {
             alert("Access Denied. Admin or Owner role required.");
             setActiveTab('ANONPAY'); // Reset to public tab
             return;
         }
         
         if (tab === 'ADMIN' || tab === 'MARKETMAKER') {
-            // For MARKETMAKER, require admin login first
-            if (tab === 'MARKETMAKER' && !isAdminLoggedIn) {
-                // Store the intended tab but don't set it yet - wait for password verification
-                setPendingAdminTab(tab);
-                setAdminGateInput('');
-                setAdminGateError('');
-                setShowAdminGateModal(true);
-                return;
-            }
-            
-            if (tab === 'ADMIN') {
+            // For MARKETMAKER and ADMIN, require admin login first
+            if (!isAdminLoggedIn) {
                 // Store the intended tab but don't set it yet - wait for password verification
                 setPendingAdminTab(tab);
                 setAdminGateInput('');
@@ -1233,7 +1200,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
         }
     }
     
-    // For other tabs (ULTIBOT, ULTICLEANER, MARKETMAKER), set the tab now
+    // For other tabs, set the tab now
     setActiveTab(tab);
   };
 
@@ -1284,8 +1251,6 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       setShowWalletModal(true);
   };
 
-  // AnonPay Security: Wallet disconnects on page refresh/close for maximum security
-  // No localStorage persistence - users must reconnect wallet on every visit
   const handleWalletDisconnect = async () => {
     try {
       // Try to disconnect generic provider
@@ -1293,7 +1258,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       if (provider && provider.disconnect) {
           await provider.disconnect();
       }
-
+      
       const solflare = (window as any).solflare;
       if (solflare && solflare.disconnect) {
           await solflare.disconnect();
@@ -1306,7 +1271,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     setConnectedAddress('');
     setUserWalletBalance(0);
     setUserTokens([]);
-    addLog("🔌 Wallet Disconnected - Must reconnect on next use.");
+    addLog("🔌 Wallet Disconnected.");
   };
 
   // Helper to find provider with retries (React hydration race condition)
@@ -1356,8 +1321,6 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
   const [pendingProvider, setPendingProvider] = useState<WalletProvider>('NONE');
 
-  // AnonPay Security: Fresh wallet connection required on every page load
-  // No persistence - each session requires explicit user authorization
   const connectSpecificWallet = async (provider: WalletProvider) => {
       // SECURITY CHECK: HTTPS is mandatory for real wallet interactions
       if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
@@ -1377,55 +1340,22 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
               return;
           }
 
-          // Force manual signature for EVERY connection (maximum security)
+          // Attempt connection
           try {
-              console.log(`🔐 AnonPay Security: Forcing manual signature for ${provider}`);
-
-              // Step 1: Connect wallet (may auto-connect)
-              let connectOptions = {};
-              if (provider === 'PHANTOM') {
-                  // Force Phantom to always require approval
-                  connectOptions = { onlyIfTrusted: false };
-              }
-
-              const resp = await walletObj.connect(connectOptions);
+              const resp = await walletObj.connect();
+              // Handle different response structures (Phantom vs Solflare)
               const pubKey = resp?.publicKey?.toString() || walletObj.publicKey?.toString();
-
-              if (!pubKey) {
-                  throw new Error("No public key returned from wallet");
-              }
-
-              console.log(`🔐 AnonPay Security: Wallet connected, now requiring manual signature`);
-
-              // Step 2: Force manual signature by signing a message
-              // This ensures fresh user authorization even if wallet was already connected
-              const message = `AnonPay Security: Confirm wallet connection\nTimestamp: ${Date.now()}\nAddress: ${pubKey}`;
-              const encodedMessage = new TextEncoder().encode(message);
-
-              let signature;
-              try {
-                  if (provider === 'PHANTOM') {
-                      signature = await walletObj.signMessage(encodedMessage, 'utf8');
-                  } else {
-                      // Solflare
-                      signature = await walletObj.signMessage(encodedMessage);
-                  }
-
-                  console.log(`✅ AnonPay Security: Manual signature completed for ${provider}`);
-                  addLog(`🔐 Manual signature verified - secure connection established`);
-
+              
+              if (pubKey) {
                   setPendingProvider(provider);
-                  finishConnection(provider, pubKey);
-
-              } catch (signError) {
-                  console.error('Manual signature rejected:', signError);
-                  addLog(`❌ Manual signature rejected - connection cancelled for security`);
-                  throw new Error("User rejected manual signature");
+                  // Pass walletObj and provider directly to avoid state timing issues
+                  finishConnection(provider, pubKey, walletObj);
+              } else {
+                  throw new Error("No public key returned");
               }
-
           } catch (connErr) {
-              console.error('Connection with manual signature failed:', connErr);
-              addLog(`❌ Secure connection failed - manual signature required`);
+              console.error(connErr);
+              addLog(`⚠️ ${provider} Connection rejected by user.`);
           }
 
       } catch (err) {
@@ -1434,68 +1364,158 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       }
   };
 
-  const finishConnection = async (provider: WalletProvider, address: string) => {
+  const finishConnection = async (provider: WalletProvider, address: string, walletObj?: any) => {
     setPendingWalletAddress(address);
     setPendingProvider(provider);
     setShowWalletModal(false);
-
-    // Check if profile already exists for this wallet
+    
+    // Check if user already has a profile
     try {
-      const checkResponse = await fetch(`/api/profile/check/${encodeURIComponent(address)}`);
-
+      const checkResponse = await fetch(`/api/profile/check/${address}`);
       if (checkResponse.ok) {
         const checkData = await checkResponse.json();
-
         if (checkData.exists) {
-          // Profile exists, update login stats and connect directly
-          try {
-            await fetch('/api/profile/connect', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                wallet: address,
-              }),
-            });
-          } catch (updateError) {
-            console.warn('Failed to update login stats, but continuing with connection:', updateError);
-          }
-
-          setUserPromoCode(checkData.promoCode);
-
-          setUserProfile({
-            id: address,
-            email: '',
-            name: checkData.username || `Wallet ${address.substring(0, 6)}`,
-            provider: provider,
-            role: 'USER',
-            wallet: address,
-            username: checkData.username,
-            promoCode: checkData.promoCode,
-            twitterHandle: checkData.twitterHandle,
-            tiktokHandle: checkData.tiktokHandle,
-            facebookHandle: checkData.facebookHandle,
-          });
-
-          setConnectedProvider(provider);
-          setConnectedAddress(address);
-          setUserWalletConnected(true);
-          setPendingWalletAddress('');
-
-          await fetchWalletBalances(address);
-
-          addLog(`💳 Connected with ${provider}. Address: ${address.substring(0,6)}...`);
-          addLog(`✅ Profile found! Username: ${checkData.username || 'Generated'}, Promo code: ${checkData.promoCode}`);
-          addLog(`✅ Welcome back!`);
+          // User already exists - automatically request signature for sign-in
+          // Pass walletObj, provider, and address directly to avoid state timing issues
+          await handleSignIn(walletObj, provider, address);
           return;
         }
       }
-    } catch (error) {
-      console.error('Error checking existing profile:', error);
-      // Continue to show promo modal if check fails
+    } catch (err) {
+      console.error('Error checking profile:', err);
     }
-
-    // Profile doesn't exist, show promo code modal for new profile creation
+    
+    // New user - show signup modal
     setShowPromoCodeModal(true);
+  };
+
+  const handleSignIn = async (walletObjParam?: any, providerParam?: WalletProvider, addressParam?: string) => {
+    // Use passed address if available, otherwise fall back to state
+    const walletAddress = addressParam || pendingWalletAddress;
+    
+    if (!walletAddress) {
+      addLog('❌ Error: Wallet address is missing');
+      return;
+    }
+    
+    try {
+      // Request hard signature from wallet to verify ownership
+      // Use passed walletObj if available, otherwise detect it
+      let walletObj = walletObjParam;
+      let provider = providerParam || pendingProvider;
+      if (!walletObj) {
+        walletObj = await detectProvider(provider);
+        if (!walletObj) {
+          throw new Error('Wallet not found. Please reconnect your wallet.');
+        }
+      }
+
+      // Create sign-in message
+      const message = new TextEncoder().encode(
+        `Sign in to UltibotTools\n\nWallet: ${walletAddress}\nTimestamp: ${Date.now()}`
+      );
+
+      // Request signature from wallet (hard sign)
+      let signature: Uint8Array;
+      try {
+        // Phantom and most Solana wallets use signMessage with message and optional display parameter
+        if (typeof (walletObj as any).signMessage === 'function') {
+          // Try Phantom format first (message, display)
+          if (provider === 'PHANTOM' || (walletObj as any).isPhantom) {
+            const signed = await (walletObj as any).signMessage(message, 'utf8');
+            signature = signed.signature;
+          } else {
+            // Other wallets (Solflare, etc.)
+            const signed = await (walletObj as any).signMessage(message);
+            signature = signed.signature || signed;
+          }
+        } else {
+          throw new Error('Wallet does not support message signing');
+        }
+      } catch (signErr: any) {
+        addLog(`❌ Signature rejected: ${signErr.message || 'User cancelled'}`);
+        throw new Error('Signature required to sign in. Please approve the signature request in your wallet.');
+      }
+
+      if (!signature || signature.length === 0) {
+        throw new Error('Invalid signature received from wallet');
+      }
+
+      // Verify signature using nacl (Ed25519 verification)
+      try {
+        const publicKey = new PublicKey(walletAddress);
+        const publicKeyBytes = publicKey.toBytes();
+        
+        // nacl.sign.detached.verify(message, signature, publicKey)
+        const isValid = nacl.sign.detached.verify(
+          message,
+          signature,
+          publicKeyBytes
+        );
+        
+        if (!isValid) {
+          throw new Error('Signature verification failed. The signature does not match your wallet.');
+        }
+      } catch (verifyErr: any) {
+        addLog(`❌ Signature verification failed: ${verifyErr.message}`);
+        throw new Error('Invalid signature. Please try signing in again.');
+      }
+
+      addLog('✅ Signature verified. Completing sign-in...');
+
+      // Sign in existing user with verified signature
+      const response = await fetch('/api/profile/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet: walletAddress,
+          twitterHandle: profileTwitter?.trim() || undefined,
+          tiktokHandle: profileTikTok?.trim() || undefined,
+          facebookHandle: profileFacebook?.trim() || undefined,
+        }),
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const errorMessage = errorData.error || 'Failed to sign in';
+        addLog(`❌ ${errorMessage}`);
+        throw new Error(errorMessage);
+      }
+      
+      const data = await response.json();
+      setUserPromoCode(data.promoCode);
+      
+      // Set user profile
+      setUserProfile({
+        id: walletAddress,
+        email: '',
+        name: data.username || `Wallet ${walletAddress.substring(0, 6)}`,
+        provider: provider,
+        role: 'USER',
+        wallet: walletAddress,
+        username: data.username,
+        promoCode: data.promoCode,
+        referredBy: data.referredBy,
+        twitterHandle: data.twitterHandle || profileTwitter?.trim() || undefined,
+        tiktokHandle: data.tiktokHandle || profileTikTok?.trim() || undefined,
+        facebookHandle: data.facebookHandle || profileFacebook?.trim() || undefined,
+      });
+      
+      setConnectedProvider(provider);
+      setConnectedAddress(walletAddress);
+      setUserWalletConnected(true);
+      setPendingWalletAddress('');
+      setProfileTwitter('');
+      setProfileTikTok('');
+      setProfileFacebook('');
+      await fetchWalletBalances(walletAddress);
+      
+      addLog(`💳 Signed in with ${provider}. Address: ${walletAddress.substring(0,6)}...`);
+      addLog(`✅ Welcome back! Username: ${data.username || 'User'}, Promo code: ${data.promoCode}`);
+    } catch (err: any) {
+      console.error('Failed to sign in:', err);
+      alert(err?.message || 'Failed to sign in. Please try again.');
+    }
   };
 
   const handlePromoCodeSubmit = async () => {
@@ -1807,6 +1827,64 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 };
 
   // --- Privacy Helper Functions ---
+  // Helper to parse private key and create a wallet provider for PrivacyCashDirect
+  const createWalletProviderFromPrivateKey = (privateKey: string): { publicKey: PublicKey; signMessage: (message: Uint8Array) => Promise<{ signature: Uint8Array }>; signTransaction: (tx: VersionedTransaction) => Promise<VersionedTransaction>; signAllTransactions: (txs: VersionedTransaction[]) => Promise<VersionedTransaction[]> } => {
+    let keypair: Keypair;
+    
+    try {
+      // Try JSON array format
+      const cleaned = privateKey.trim();
+      try {
+        const arr = JSON.parse(cleaned);
+        if (Array.isArray(arr)) {
+          const bytes = Uint8Array.from(arr);
+          keypair = Keypair.fromSecretKey(bytes);
+        } else {
+          throw new Error('Not a JSON array');
+        }
+      } catch {
+        // Try hex format
+        const hexInput = cleaned.startsWith('0x') ? cleaned.slice(2) : cleaned;
+        if (/^[0-9a-fA-F]+$/.test(hexInput) && hexInput.length === 64) {
+          const bytes = new Uint8Array(32);
+          for (let i = 0; i < 64; i += 2) {
+            bytes[i / 2] = parseInt(hexInput.substring(i, i + 2), 16);
+          }
+          keypair = Keypair.fromSecretKey(bytes);
+        } else {
+          // Try base58
+          // Try base58 (fallback - may not work in browser without bs58)
+          try {
+            // @ts-ignore - bs58 may not be available
+            const bs58 = require('bs58');
+            const decoded = bs58.decode(cleaned);
+            keypair = Keypair.fromSecretKey(decoded);
+          } catch {
+            throw new Error('Invalid private key format. Supported: JSON array, hex (64 chars), or base58');
+          }
+        }
+      }
+    } catch (error: any) {
+      throw new Error(`Failed to parse private key: ${error.message}`);
+    }
+
+    return {
+      publicKey: keypair.publicKey,
+      signMessage: async (message: Uint8Array) => {
+        const signature = nacl.sign.detached(message, keypair.secretKey);
+        return { signature };
+      },
+      signTransaction: async (tx: VersionedTransaction) => {
+        tx.sign([keypair]);
+        return tx;
+      },
+      signAllTransactions: async (txs: VersionedTransaction[]) => {
+        txs.forEach(tx => tx.sign([keypair]));
+        return txs;
+      },
+    };
+  };
+
   const queuePrivacyTransfer = (
     fromRole: SpecialRole | undefined, 
     fromWalletId: string | undefined, 
@@ -1959,7 +2037,9 @@ const executeAnonPayBatch = async () => {
         : (window as any).solflare;
     if (!provider?.publicKey) return alert("Wallet not connected properly.");
 
-    const connection = new solanaWeb3.Connection('', "confirmed");
+    // Use configured RPC URL or fallback to default
+    const rpcEndpoint = rpcUrl || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
+    const connection = new solanaWeb3.Connection(rpcEndpoint, "confirmed");
     const sender = new solanaWeb3.PublicKey(provider.publicKey.toString());
 
     // ✅ validate addresses first
@@ -2221,7 +2301,7 @@ const executeAnonPayBatch = async () => {
     if (marketData.marketCap >= config.targetMarketCapSell) {
         addLog(`🛑 TARGET MARKET CAP ($${config.targetMarketCapSell.toLocaleString()}) REACHED. Stopping.`);
         setAppState(AppState.IDLE);
-      authFetch('/api/ultibot/config', { method: 'POST', body: JSON.stringify({ enabled: false }) }).catch(() => {});
+      fetch('/api/ultibot/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) }).catch(() => {});
         return;
     }
 
@@ -2354,88 +2434,178 @@ const executeAnonPayBatch = async () => {
 
   // --- ALL HOOKS MUST BE BEFORE EARLY RETURNS ---
   
+  // --- Real Privacy Cash Queue Processor (async) ---
+  useEffect(() => {
+    let processing = false;
+    
+    const processPrivacyQueue = async () => {
+      if (processing) return;
+      processing = true;
+      
+      try {
+        // Get current privacy state
+        setPrivacyState(prev => {
+          const queuedItems = prev.queue.filter(item => item.status === 'QUEUED' && item.assetType === 'SOL');
+          if (queuedItems.length === 0) {
+            processing = false;
+            return prev;
+          }
+          
+          // Process first queued item
+          const item = queuedItems[0];
+          
+          // Get source wallet (fromRole or fromWalletId) - access from closure
+          let sourceWallet: SpecialWallet | undefined;
+          let recipientAddress: string | undefined;
+          
+          if (item.fromRole) {
+            sourceWallet = specialWallets.find(w => w.role === item.fromRole && w.privateKey);
+          } else if (item.fromWalletId) {
+            // Try to find wallet in walletGroups (for frontend-managed wallets)
+            const group = walletGroups.find(g => g.wallets.some(w => w.id === item.fromWalletId));
+            const wallet = group?.wallets.find(w => w.id === item.fromWalletId);
+            if (wallet && wallet.privateKey) {
+              // Create a temporary SpecialWallet-like object for processing
+              // Note: We use a type assertion since this is a temporary object for processing
+              sourceWallet = {
+                role: 'FUNDING' as SpecialRole, // Temporary role for processing
+                address: wallet.address,
+                privateKey: wallet.privateKey,
+                balanceSol: wallet.balanceSol
+              } as SpecialWallet;
+            } else {
+              // Cycle wallet - private key is in backend, can't do privacy transfer from frontend
+              // Backend should handle this or fall back to direct transfer
+              console.warn('Cannot process privacy transfer from cycle wallet - private key not available in frontend:', item.fromWalletId);
+              processing = false;
+              return prev;
+            }
+          }
+          
+          // Get recipient address
+          if (item.toAddress) {
+            recipientAddress = item.toAddress;
+          } else if (item.toRole) {
+            const toWallet = specialWallets.find(w => w.role === item.toRole);
+            recipientAddress = toWallet?.publicKey;
+          } else if (item.toWalletId) {
+            // Find wallet in groups
+            const group = walletGroups.find(g => g.wallets.some(w => w.id === item.toWalletId));
+            const wallet = group?.wallets.find(w => w.id === item.toWalletId);
+            recipientAddress = wallet?.address;
+          }
+          
+          if (!sourceWallet?.privateKey || !recipientAddress) {
+            processing = false;
+            return prev;
+          }
+          
+          // Process asynchronously (capture item and addresses)
+          const processItem = async (queueItem: PrivacyQueueItem, source: SpecialWallet, recipient: string) => {
+            try {
+              // Update status to MIXING
+              setPrivacyState(prevState => ({
+                ...prevState,
+                queue: prevState.queue.map(q => q.id === queueItem.id ? { ...q, status: 'MIXING' } : q)
+              }));
+              
+              addLog(`🛡️ Processing privacy transfer: ${queueItem.amount.toFixed(4)} SOL from ${queueItem.fromRole || 'wallet'} to ${recipient.substring(0, 8)}...`);
+              
+              // Create wallet provider from private key
+              const walletProvider = createWalletProviderFromPrivateKey(source.privateKey!);
+              
+              // Create connection
+              const rpcEndpoint = rpcUrl || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
+              const connection = new Connection(rpcEndpoint, 'confirmed');
+              
+              // Create PrivacyCashDirect instance
+              const privacyCash = new PrivacyCashDirect({
+                connection,
+                wallet: walletProvider,
+                circuitBaseUrl: '/circuit2',
+                enableDebug: true,
+              });
+              
+              // Initialize
+              await privacyCash.initialize();
+              
+              // Execute private transfer
+              const amountLamports = Math.round(queueItem.amount * LAMPORTS_PER_SOL);
+              await privacyCash.privateTransfer({
+                lamports: amountLamports,
+                recipientAddress: recipient,
+              });
+              
+              // Update balances
+              if (queueItem.fromRole) {
+                setSpecialWallets(wallets => wallets.map(w => 
+                  w.role === queueItem.fromRole ? { ...w, balanceSol: w.balanceSol - queueItem.amount } : w
+                ));
+              }
+              
+              if (queueItem.toRole) {
+                setSpecialWallets(wallets => wallets.map(w => 
+                  w.role === queueItem.toRole ? { ...w, balanceSol: w.balanceSol + queueItem.amount } : w
+                ));
+              } else if (queueItem.toWalletId) {
+                // Update wallet in frontend-managed groups
+                setWalletGroups(groups => groups.map(g => ({
+                  ...g,
+                  wallets: g.wallets.map(w => w.id === queueItem.toWalletId ? { ...w, balanceSol: w.balanceSol + queueItem.amount } : w)
+                })));
+              } else if (queueItem.toAddress) {
+                // For external addresses (cycle wallets from backend, AnonPay recipients, etc.)
+                // Check if it's an AnonPay recipient first
+                const isAnonPayRecipient = anonPayRecipients.some(r => r.address === queueItem.toAddress);
+                if (isAnonPayRecipient) {
+                  setAnonPayRecipients(prev => prev.map(r => r.address === queueItem.toAddress ? { ...r, status: 'COMPLETED' } : r));
+                }
+                // For cycle wallets from backend, we don't update frontend state
+                // (balances are tracked in backend database)
+                // Just log the successful transfer
+              }
+              
+              // Mark as completed
+              setPrivacyState(prevState => ({
+                ...prevState,
+                shadowPoolBalanceSol: prevState.shadowPoolBalanceSol - queueItem.amount,
+                totalVolumeAnonymized: prevState.totalVolumeAnonymized + queueItem.amount,
+                queue: prevState.queue.filter(q => q.id !== queueItem.id)
+              }));
+              
+              addLog(`✅ Privacy transfer completed: ${queueItem.amount.toFixed(4)} SOL`);
+            } catch (error: any) {
+              console.error('Privacy transfer failed:', error);
+              addLog(`❌ Privacy transfer failed: ${error.message}`);
+              
+              // Mark as failed (remove from queue)
+              setPrivacyState(prevState => ({
+                ...prevState,
+                queue: prevState.queue.filter(q => q.id !== queueItem.id)
+              }));
+            } finally {
+              processing = false;
+            }
+          };
+          
+          // Start processing
+          processItem(item, sourceWallet, recipientAddress);
+          
+          return prev;
+        });
+      } catch (error) {
+        processing = false;
+      }
+    };
+    
+    // Process queue every 2 seconds
+    const interval = setInterval(processPrivacyQueue, 2000);
+    return () => clearInterval(interval);
+  }, [privacyState.queue.length, specialWallets, walletGroups, rpcUrl]);
+  
   // --- Simulation Loop ---
   useEffect(() => {
     intervalRef.current = window.setInterval(() => {
-        
-        // 0. PRIVACY SHIELD ENGINE
-        setPrivacyState(prev => {
-          const now = Date.now();
-          let updatedQueue = [...prev.queue];
-          let updatedShadowSol = prev.shadowPoolBalanceSol;
-          let updatedShadowTokens = prev.shadowPoolBalanceTokens;
-          let updatedTotalVol = prev.totalVolumeAnonymized;
-          
-          updatedQueue = updatedQueue.map(item => {
-            // STEP 1: DEPOSIT
-            if (item.status === 'QUEUED') {
-              const depositHash = `dep-${Math.random().toString(36).substring(7)}`;
-              
-              if (item.fromRole) {
-                 setSpecialWallets(wallets => wallets.map(w => 
-                    w.role === item.fromRole ? { ...w, balanceSol: w.balanceSol - item.amount } : w
-                 ));
-                 setTransactions(txs => [{ 
-                   id: Math.random().toString(), hash: depositHash, sender: "Internal", receiver: generateMixerAddress(),
-                   type: 'MIXER_DEPOSIT' as const, amountSol: item.amount, assetSymbol: item.tokenSymbol || 'SOL', timestamp: now, isIntruder: false, isPrivacyAction: true 
-                 }, ...txs].slice(0, 10));
-              } else {
-                 setTransactions(txs => [{ 
-                   id: Math.random().toString(), hash: depositHash, sender: "User Wallet", receiver: generateMixerAddress(),
-                   type: 'MIXER_DEPOSIT' as const, amountSol: item.amount, assetSymbol: item.tokenSymbol || 'SOL', timestamp: now, isIntruder: false, isPrivacyAction: true 
-                 }, ...txs].slice(0, 10));
-              }
-
-              if (item.assetType === 'SOL') updatedShadowSol += item.amount;
-              else updatedShadowTokens += item.amount;
-              
-              addLog(`🛡️ Shield Deposit: ${item.amount.toFixed(2)} ${item.tokenSymbol || 'SOL'}.`);
-              return { ...item, status: 'MIXING', depositTxHash: depositHash, zkProofNote: generateZKProof() };
-            }
-
-            // STEP 2: RELAY
-            if (item.status === 'MIXING' && now > item.releaseTime) {
-               const relayHash = `relay-${Math.random().toString(36).substring(7)}`;
-               const relayerAddr = generateRelayerAddress();
-
-               if (item.toRole) {
-                 setSpecialWallets(wallets => wallets.map(w => 
-                    w.role === item.toRole ? { ...w, balanceSol: w.balanceSol + item.amount } : w
-                 ));
-               } else if (item.toWalletId) {
-                 setWalletGroups(groups => groups.map(g => ({
-                    ...g,
-                    wallets: g.wallets.map(w => w.id === item.toWalletId ? { ...w, balanceSol: w.balanceSol + item.amount } : w)
-                 })));
-               } else if (item.toAddress) {
-                 setAnonPayRecipients(prev => prev.map(r => r.address === item.toAddress ? { ...r, status: 'COMPLETED' } : r));
-               }
-
-               setTransactions(txs => [{ 
-                   id: Math.random().toString(), hash: relayHash, sender: relayerAddr, receiver: item.toAddress || 'Internal',
-                   type: 'RELAY_WITHDRAW' as const, amountSol: item.amount, assetSymbol: item.tokenSymbol || 'SOL', timestamp: now, isIntruder: false, isPrivacyAction: true 
-               }, ...txs].slice(0, 10));
-
-               if (item.assetType === 'SOL') {
-                   updatedShadowSol -= item.amount;
-                   updatedTotalVol += item.amount;
-               } else {
-                   updatedShadowTokens -= item.amount;
-               }
-               
-               addLog(`👻 Relay Complete: ${item.amount.toFixed(2)} ${item.tokenSymbol || 'SOL'}.`);
-               return { ...item, status: 'COMPLETED' };
-            }
-            return item;
-          });
-
-          return {
-            shadowPoolBalanceSol: updatedShadowSol,
-            shadowPoolBalanceTokens: updatedShadowTokens,
-            totalVolumeAnonymized: updatedTotalVol,
-            queue: updatedQueue.filter(i => i.status !== 'COMPLETED')
-          };
-        });
 
         // --- Market & Simulation Loop ---
         // Only run logic if system is Active OR if we are Waiting for Exit (to simulate sell pressure)
@@ -2534,7 +2704,7 @@ const executeAnonPayBatch = async () => {
           if (allComplete) {
             if (marketData.marketCap >= config.targetMarketCapSell) {
               setAppState(AppState.IDLE);
-              authFetch('/api/ultibot/config', { method: 'POST', body: JSON.stringify({ enabled: false }) }).catch(() => {});
+              fetch('/api/ultibot/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) }).catch(() => {});
               addLog(`🛑 Target Market Cap reached. Stopping.`);
             } else {
               setAppState(AppState.RESTARTING);
@@ -2550,8 +2720,9 @@ const executeAnonPayBatch = async () => {
                 initializeCycle(next);
                 setAppState(AppState.RUNNING);
       // Sync config to backend listener
-      authFetch('/api/ultibot/config', {
+      fetch('/api/ultibot/config', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           enabled: true,
           tokenMint: monitoredTokenAddress,
@@ -2576,7 +2747,7 @@ const executeAnonPayBatch = async () => {
                 initializeCycle(next);
                 setAppState(AppState.RUNNING);
       // Sync config to backend listener
-      authFetch('/api/ultibot/config', {
+      fetch('/api/ultibot/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2804,11 +2975,12 @@ const executeAnonPayBatch = async () => {
                  <button
                    onClick={() => {
                      setShowLoginModal(false);
-                     // If not authenticated, redirect to public AnonPay tab
-                     if (!isLoggedIn) {
+                     // If closing modal without login, reset to ANONPAY and clear pending tab
+                     setPendingAdminTab(null);
+                     if (activeTab === 'ULTIBOT') {
                        setActiveTab('ANONPAY');
-                       setViewMode('APP');
                      }
+                     setViewMode('APP');
                    }}
                    className="text-gray-400 hover:text-white transition-colors"
                  >
@@ -3012,6 +3184,7 @@ const executeAnonPayBatch = async () => {
         </div>
       )}
 
+      {/* Sign In Modal - for existing users */}
       {/* Key Modal */}
       {showKeyModal && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
@@ -3050,7 +3223,7 @@ const executeAnonPayBatch = async () => {
               </button>
                {/* Mobile Status Badge */}
                <div className="md:hidden text-[10px] bg-gray-800 px-2 py-1 rounded text-gray-400 border border-gray-700">
-                 Role: <span className="text-white font-bold">{utilbotUserRole}</span>
+                 Role: <span className="text-white font-bold">{currentUserRole}</span>
                </div>
             </div>
             
@@ -3058,20 +3231,20 @@ const executeAnonPayBatch = async () => {
             <div className="w-full md:w-auto overflow-x-auto pb-1 md:pb-0 no-scrollbar">
                 <div className="flex items-center bg-gray-900 rounded-lg p-1 border border-gray-700 min-w-max mx-auto">
                 <button onClick={() => handleTabClick('ULTIBOT')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ULTIBOT' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
-                    {(!isLoggedIn) && <Lock className="w-3 h-3"/>} ULTIBOT TOOLS
+                    {(!getToken()) && <Lock className="w-3 h-3"/>} ULTIBOT TOOLS
                 </button>
                 <button onClick={() => handleTabClick('ANONPAY')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ANONPAY' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
                     ANONPAY
                 </button>
                 {/* ULTI CLEANER tab hidden but backend code remains */}
                 {/* <button onClick={() => handleTabClick('ULTICLEANER')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ULTICLEANER' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
-                    {!(utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ULTI CLEANER
+                    {!(currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ULTI CLEANER
                 </button> */}
                 <button onClick={() => handleTabClick('ADMIN')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'ADMIN' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
-                    {!(utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ADMIN
+                    {!(currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && <Lock className="w-3 h-3 text-gray-500"/>} ADMIN
                 </button>
                 {/* Market Maker only visible after admin login */}
-                {isAdminLoggedIn && (utilbotUserRole === 'ADMIN' || utilbotUserRole === 'OWNER') && (
+                {isAdminLoggedIn && (currentUserRole === 'ADMIN' || currentUserRole === 'OWNER') && (
                 <button onClick={() => handleTabClick('MARKETMAKER')} className={`flex items-center gap-2 px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${activeTab === 'MARKETMAKER' ? 'bg-primary text-white' : 'text-gray-400 hover:text-white'}`}>
                     MARKET MAKER
                 </button>
@@ -3081,7 +3254,7 @@ const executeAnonPayBatch = async () => {
             
             <div className="hidden md:flex items-center gap-4">
                <div className="text-[10px] bg-gray-800 px-2 py-1 rounded text-gray-400 border border-gray-700">
-                 Status: <span className="text-white font-bold">{utilbotUserRole}</span>
+                 Status: <span className="text-white font-bold">{currentUserRole}</span>
                </div>
 
                {isLoggedIn ? (
@@ -3098,7 +3271,7 @@ const executeAnonPayBatch = async () => {
       <div className="max-w-7xl mx-auto p-4 md:p-6">
         
         {/* --- ULTIBOT TOOLS TAB --- */}
-        {activeTab === 'ULTIBOT' && isLoggedIn && (
+        {activeTab === 'ULTIBOT' && (
           <div className="space-y-6">
 
             {/* Documentation Module */}
@@ -4666,7 +4839,7 @@ const executeAnonPayBatch = async () => {
                 <div className="bg-surface border border-gray-700 rounded-xl overflow-hidden">
                     <div className="p-5 border-b border-gray-700 flex justify-between items-center">
                         <h3 className="font-bold">User Management</h3>
-                        {utilbotUserRole === 'OWNER' && (
+                        {currentUserRole === 'OWNER' && (
                             <div className="flex gap-2">
                                 <input 
                                     type="email" 

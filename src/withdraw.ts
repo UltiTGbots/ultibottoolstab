@@ -225,8 +225,8 @@ export async function withdraw({ recipient, lightWasm, storage, publicKey, conne
 
     // Encrypt the UTXO data using a compact format that includes the keypair
     logger.debug('\nEncrypting UTXOs with keypair data...');
-    const encryptedOutput1 = encryptionService.encryptUtxo(outputs[0]);
-    const encryptedOutput2 = encryptionService.encryptUtxo(outputs[1]);
+    const encryptedOutput1 = await encryptionService.encryptUtxo(outputs[0]);
+    const encryptedOutput2 = await encryptionService.encryptUtxo(outputs[1]);
 
     logger.debug(`\nOutput[0] (change):`);
     await outputs[0].log();

@@ -25,6 +25,23 @@ import { calculateCycleFunding, calculateWalletFundingAmount } from './funding';
 import { createRetryConnection } from './rpc-retry';
 import pLimit from 'p-limit';
 
+// Import Privacy Cash for backend privacy transfers
+// Note: Privacy Cash SDK is designed for Node.js and can be used in backend
+// If not available, privacy transfers will fall back to direct transfers or emit events
+let PrivacyCash: any = null;
+try {
+  // Try to import PrivacyCash from the src directory
+  // Path is relative to server/src/ultibot/engine.ts -> ../../../src/index.js
+  const privacyCashModule = require('../../../src/index.js');
+  PrivacyCash = privacyCashModule?.PrivacyCash || null;
+  if (PrivacyCash) {
+    console.log('[Engine] Privacy Cash SDK loaded successfully');
+  }
+} catch (e: any) {
+  // Privacy Cash SDK not available - will use direct transfers or emit events
+  console.warn('[Engine] Privacy Cash SDK not available, privacy transfers will use direct transfers or emit events:', e?.message || e);
+}
+
 export type UltibotEngine = ReturnType<typeof createUltibotEngine>;
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -602,12 +619,68 @@ export function createUltibotEngine(opts: {
           if (profitPk) {
             profitLamports = Math.floor(remainingLamports * 0.25); // 25% to profit wallet
             if (profitLamports > 0) {
-              await transferSol(conn, kp, profitPk, profitLamports);
-              log('INFO', 'PROFIT_ROUTING', 'Transferred profits to profit wallet', {
-                wallet: kp.publicKey.toBase58(),
-                amount: profitLamports,
-                profitWallet: profitPk.toBase58()
-              });
+              // Check if privacy mode is enabled
+              if (cfg.usePrivacyMode && PrivacyCash) {
+                try {
+                  // Use Privacy Cash SDK directly in backend (we have the private key)
+                  const privacyCash = new PrivacyCash({
+                    RPC_url: conn.rpcEndpoint,
+                    owner: kp.secretKey,
+                    enableDebug: false
+                  });
+                  
+                  // Deposit to privacy pool first, then withdraw to profit wallet
+                  await privacyCash.deposit({ lamports: profitLamports });
+                  await privacyCash.withdraw({ 
+                    recipient: profitPk.toBase58(),
+                    lamports: profitLamports 
+                  });
+                  
+                  log('INFO', 'PRIVACY_PROFIT_ROUTING', 'Privacy profit transfer completed (backend)', {
+                    wallet: kp.publicKey.toBase58(),
+                    amount: (profitLamports / 1_000_000_000).toFixed(4) + ' SOL',
+                    profitWallet: profitPk.toBase58()
+                  });
+                } catch (e: any) {
+                  log('WARN', 'PRIVACY_PROFIT_ROUTING_FAILED', 'Privacy transfer failed, falling back to direct', {
+                    wallet: kp.publicKey.toBase58(),
+                    error: String(e?.message ?? e)
+                  });
+                  // Fall back to direct transfer
+                  await transferSol(conn, kp, profitPk, profitLamports);
+                  log('INFO', 'PROFIT_ROUTING', 'Transferred profits to profit wallet (direct fallback)', {
+                    wallet: kp.publicKey.toBase58(),
+                    amount: profitLamports,
+                    profitWallet: profitPk.toBase58()
+                  });
+                }
+              } else if (cfg.usePrivacyMode && !PrivacyCash) {
+                // Privacy mode enabled but SDK not available - emit event for frontend
+                // Frontend can handle if it has the wallet in its state
+                opts.io.emit('privacy_profit_transfer', {
+                  fromWallet: kp.publicKey.toBase58(),
+                  fromWalletId: pos.wallet_id,
+                  toWallet: profitPk.toBase58(),
+                  toRole: 'PROFIT',
+                  amountSol: profitLamports / 1_000_000_000,
+                  amountLamports: profitLamports,
+                  cycleId: pos.cycle_id,
+                  positionId: pos.id
+                });
+                log('INFO', 'PRIVACY_PROFIT_ROUTING', 'Privacy profit transfer requested (frontend)', {
+                  wallet: kp.publicKey.toBase58(),
+                  amount: (profitLamports / 1_000_000_000).toFixed(4) + ' SOL',
+                  profitWallet: profitPk.toBase58()
+                });
+              } else {
+                // Direct transfer (non-privacy mode)
+                await transferSol(conn, kp, profitPk, profitLamports);
+                log('INFO', 'PROFIT_ROUTING', 'Transferred profits to profit wallet (direct)', {
+                  wallet: kp.publicKey.toBase58(),
+                  amount: profitLamports,
+                  profitWallet: profitPk.toBase58()
+                });
+              }
               remainingLamports -= profitLamports;
             }
           }
@@ -615,12 +688,68 @@ export function createUltibotEngine(opts: {
           // Return remaining SOL to funding wallet if configured
           if (fundingKp && remainingLamports > 0) {
             fundingLamports = remainingLamports;
-            await transferSol(conn, kp, fundingKp.publicKey, fundingLamports);
-            log('INFO', 'FUNDING_RETURN', 'Returned remaining SOL to funding wallet', {
-              wallet: kp.publicKey.toBase58(),
-              amount: fundingLamports,
-              fundingWallet: fundingKp.publicKey.toBase58()
-            });
+            // Check if privacy mode is enabled
+            if (cfg.usePrivacyMode && PrivacyCash) {
+              try {
+                // Use Privacy Cash SDK directly in backend (we have the private key)
+                const privacyCash = new PrivacyCash({
+                  RPC_url: conn.rpcEndpoint,
+                  owner: kp.secretKey,
+                  enableDebug: false
+                });
+                
+                // Deposit to privacy pool first, then withdraw to funding wallet
+                await privacyCash.deposit({ lamports: fundingLamports });
+                await privacyCash.withdraw({ 
+                  recipient: fundingKp.publicKey.toBase58(),
+                  lamports: fundingLamports 
+                });
+                
+                log('INFO', 'PRIVACY_FUNDING_RETURN', 'Privacy funding return completed (backend)', {
+                  wallet: kp.publicKey.toBase58(),
+                  amount: (fundingLamports / 1_000_000_000).toFixed(4) + ' SOL',
+                  fundingWallet: fundingKp.publicKey.toBase58()
+                });
+              } catch (e: any) {
+                log('WARN', 'PRIVACY_FUNDING_RETURN_FAILED', 'Privacy transfer failed, falling back to direct', {
+                  wallet: kp.publicKey.toBase58(),
+                  error: String(e?.message ?? e)
+                });
+                // Fall back to direct transfer
+                await transferSol(conn, kp, fundingKp.publicKey, fundingLamports);
+                log('INFO', 'FUNDING_RETURN', 'Returned remaining SOL to funding wallet (direct fallback)', {
+                  wallet: kp.publicKey.toBase58(),
+                  amount: fundingLamports,
+                  fundingWallet: fundingKp.publicKey.toBase58()
+                });
+              }
+            } else if (cfg.usePrivacyMode && !PrivacyCash) {
+              // Privacy mode enabled but SDK not available - emit event for frontend
+              // Frontend can handle if it has the wallet in its state
+              opts.io.emit('privacy_funding_return', {
+                fromWallet: kp.publicKey.toBase58(),
+                fromWalletId: pos.wallet_id,
+                toWallet: fundingKp.publicKey.toBase58(),
+                toRole: 'FUNDING',
+                amountSol: fundingLamports / 1_000_000_000,
+                amountLamports: fundingLamports,
+                cycleId: pos.cycle_id,
+                positionId: pos.id
+              });
+              log('INFO', 'PRIVACY_FUNDING_RETURN', 'Privacy funding return requested (frontend)', {
+                wallet: kp.publicKey.toBase58(),
+                amount: (fundingLamports / 1_000_000_000).toFixed(4) + ' SOL',
+                fundingWallet: fundingKp.publicKey.toBase58()
+              });
+            } else {
+              // Direct transfer (non-privacy mode)
+              await transferSol(conn, kp, fundingKp.publicKey, fundingLamports);
+              log('INFO', 'FUNDING_RETURN', 'Returned remaining SOL to funding wallet (direct)', {
+                wallet: kp.publicKey.toBase58(),
+                amount: fundingLamports,
+                fundingWallet: fundingKp.publicKey.toBase58()
+              });
+            }
           }
 
           log('INFO', 'PROFIT_DISTRIBUTION', 'Completed profit distribution', {
@@ -628,7 +757,8 @@ export function createUltibotEngine(opts: {
             totalSolDelta: Number(solDelta),
             profitWalletAmount: profitLamports,
             fundingWalletAmount: fundingLamports,
-            remainingInWallet: remainingLamports - fundingLamports
+            remainingInWallet: remainingLamports - fundingLamports,
+            usePrivacyMode: cfg.usePrivacyMode ?? false
           });
         } catch (e: any) {
           log('WARN', 'PROFIT_ROUTING_FAILED', 'Failed to route profits', {
