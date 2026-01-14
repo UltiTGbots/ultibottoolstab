@@ -41,12 +41,12 @@ export function calculateWalletFundingAmount(params: {
     maxPct = 0.5;
   }
   
-  // Random percentage within tier range
+  // Random percentage within tier range (as decimal, e.g., 1.5% = 0.015)
   const randomFactor = Math.random();
-  const targetSupplyPct = minPct + (maxPct - minPct) * randomFactor;
+  const targetSupplyPct = (minPct + (maxPct - minPct) * randomFactor) / 100; // Convert to decimal
   
-  // Calculate target token amount
-  const targetTokensRaw = (totalSupply * BigInt(Math.floor(targetSupplyPct * 1_000_000))) / BigInt(1_000_000_000);
+  // Calculate target token amount (targetSupplyPct is now a decimal like 0.015)
+  const targetTokensRaw = (totalSupply * BigInt(Math.floor(targetSupplyPct * 1_000_000_000))) / BigInt(1_000_000_000);
   const targetTokens = targetTokensRaw;
   
   // Calculate required SOL (with slippage buffer)
@@ -54,11 +54,16 @@ export function calculateWalletFundingAmount(params: {
   const requiredSol = targetTokensUi * priceUsd * (1 + slippageBuffer);
   const requiredSolLamports = Math.ceil(requiredSol * 1_000_000_000);
   
+  // Cap maximum SOL per wallet to prevent excessive funding (e.g., max 1 SOL per wallet)
+  const MAX_SOL_PER_WALLET = 1.0; // Maximum 1 SOL per wallet
+  const maxLamports = Math.floor(MAX_SOL_PER_WALLET * 1_000_000_000);
+  const cappedLamports = Math.min(requiredSolLamports, maxLamports);
+  
   return {
-    targetSupplyPct,
+    targetSupplyPct: targetSupplyPct * 100, // Return as percentage for display (1.5 instead of 0.015)
     targetTokens,
-    requiredSolLamports,
-    requiredSol
+    requiredSolLamports: cappedLamports,
+    requiredSol: cappedLamports / 1_000_000_000
   };
 }
 

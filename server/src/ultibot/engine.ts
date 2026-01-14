@@ -297,19 +297,89 @@ export function createUltibotEngine(opts: {
       }
     }
 
-    // Fund wallets from funding wallet using privacy transfers
-    // Note: Privacy transfers are handled by frontend Shadow Pool system
-    // Backend just needs to ensure wallets have enough SOL
+    // Fund wallets from funding wallet using frontend (private keys never stored in backend)
+    // Frontend handles all funding via privacy_funding_request events
     // Skip funding in dry-run mode since no real transactions will occur
-    if (funding && !cfg.dryRun) {
-      log('INFO', 'FUNDING', 'Funding cycle wallets before buys', {
+    if (cfg.dryRun) {
+      log('INFO', 'FUNDING_SKIPPED', 'Funding skipped (dry-run mode)', {
         cycleId: cycle.id,
-        wallets: wallets.length,
-        usePrivacyMode: cfg.usePrivacyMode ?? false
+        wallets: wallets.length
       });
+    } else {
+      // Get funding wallet address from backend config (if available) for logging
+      // Frontend will handle the actual funding using its private key
+      let fundingWalletAddress: string | null = null;
+      if (funding) {
+        fundingWalletAddress = funding.publicKey.toBase58();
+        // Check funding wallet balance for logging and adjustment
+        try {
+          const fundingBalance = await getSolBalanceLamports(conn, funding.publicKey);
+          const fundingBalanceNum = Number(fundingBalance);
+          const totalFundingNeeded = Array.from(walletFundingAmounts.values()).reduce((sum, amt) => sum + amt, 0);
+          const feesNeeded = wallets.length * 10_000_000; // 0.01 SOL per wallet for fees
+          const totalFundingWithBuffer = totalFundingNeeded + feesNeeded;
+          
+          log('INFO', 'FUNDING', 'Checking funding wallet balance', {
+            cycleId: cycle.id,
+            wallets: wallets.length,
+            usePrivacyMode: cfg.usePrivacyMode ?? false,
+            fundingWalletBalance: (fundingBalanceNum / 1e9).toFixed(4) + ' SOL',
+            calculatedNeeded: (totalFundingWithBuffer / 1e9).toFixed(4) + ' SOL'
+          });
+          
+          // Always adjust funding amounts based on available balance
+          // Reserve fees first, then distribute remaining balance
+          const availableForDistribution = fundingBalanceNum - feesNeeded;
+          
+          if (availableForDistribution > 0) {
+            // Calculate per-wallet amount from available balance
+            const perWalletAmount = Math.floor(availableForDistribution / wallets.length);
+            const minPerWallet = 10_000_000; // Minimum 0.01 SOL per wallet (just for fees)
+            
+            if (perWalletAmount < minPerWallet) {
+              log('WARN', 'FUNDING_LOW', 'Available balance is very low, using minimum per wallet', {
+                perWallet: (perWalletAmount / 1e9).toFixed(4) + ' SOL',
+                totalAvailable: (fundingBalanceNum / 1e9).toFixed(4) + ' SOL'
+              });
+            }
+            
+            // Override wallet funding amounts with available balance distribution
+            wallets.forEach((_, i) => {
+              walletFundingAmounts.set(i, Math.max(perWalletAmount, minPerWallet));
+            });
+            
+            const actualTotalNeeded = Array.from(walletFundingAmounts.values()).reduce((sum, amt) => sum + amt, 0) + feesNeeded;
+            
+            log('INFO', 'FUNDING_ADJUSTED', 'Adjusted funding amounts based on available balance', {
+              fundingWalletBalance: (fundingBalanceNum / 1e9).toFixed(4) + ' SOL',
+              perWallet: (perWalletAmount / 1e9).toFixed(4) + ' SOL',
+              totalToDistribute: (actualTotalNeeded / 1e9).toFixed(4) + ' SOL',
+              wallets: wallets.length
+            });
+          } else {
+            log('WARN', 'FUNDING_INSUFFICIENT', 'Funding wallet has insufficient balance, frontend will handle', {
+              fundingWallet: fundingWalletAddress,
+              balance: (fundingBalanceNum / 1e9).toFixed(4) + ' SOL',
+              required: (totalFundingWithBuffer / 1e9).toFixed(4) + ' SOL'
+            });
+          }
+        } catch (e: any) {
+          log('WARN', 'FUNDING_BALANCE_CHECK_FAILED', 'Could not check funding wallet balance', {
+            error: String(e?.message ?? e)
+          });
+        }
+      } else {
+        log('INFO', 'FUNDING_REQUEST', 'Requesting funding from frontend (backend has no keypair - this is expected)', {
+          cycleId: cycle.id,
+          wallets: wallets.length,
+          note: 'Frontend will handle funding using FUNDING wallet private key stored in frontend'
+        });
+      }
 
+      // Always emit funding requests to frontend (even if backend doesn't have keypair)
+      // Frontend will handle all funding using its private key
       const limit = pLimit(5);
-      await Promise.all(wallets.map((w, index) => limit(async () => {
+      const fundingPromises = wallets.map((w, index) => limit(async () => {
         const to = new PublicKey(w.pubkey);
         let bal: bigint;
         try {
@@ -319,37 +389,99 @@ export function createUltibotEngine(opts: {
             wallet: w.pubkey,
             error: String((e as any)?.message ?? e)
           });
-          return; // Skip this wallet
+          throw e; // Re-throw to fail the funding step
         }
         const requiredLamports = walletFundingAmounts.get(index) ?? 50_000_000;
         const requiredWithBuffer = requiredLamports + 10_000_000; // Add 0.01 SOL for fees
         
         if (bal >= BigInt(requiredWithBuffer)) {
           log('INFO', 'FUND_SKIP', 'Wallet already funded', { wallet: w.pubkey, balance: bal.toString() });
-          return;
+          return { wallet: w.pubkey, funded: true, skipped: true };
         }
         
-        // If privacy mode, emit event for frontend to handle via Shadow Pool
-        // Otherwise, direct transfer
-        if (cfg.usePrivacyMode) {
-          opts.io.emit('privacy_funding_request', {
-            cycleId: cycle.id,
-            walletId: w.id,
-            walletPubkey: w.pubkey,
-            amountSol: requiredLamports / 1_000_000_000,
-            amountLamports: requiredLamports,
-            walletIndex: index
+        // Always use frontend funding system for security (no private keys in backend)
+        // Frontend will handle both privacy and direct transfers
+        opts.io.emit('privacy_funding_request', {
+          cycleId: cycle.id,
+          walletId: w.id,
+          walletPubkey: w.pubkey,
+          amountSol: requiredLamports / 1_000_000_000,
+          amountLamports: requiredLamports,
+          walletIndex: index,
+          usePrivacyMode: cfg.usePrivacyMode ?? false,
+          fundingWalletAddress: fundingWalletAddress || undefined
+        });
+        log('INFO', 'FUNDING_REQUESTED', 'Funding requested from frontend', { 
+          wallet: w.pubkey, 
+          amount: (requiredLamports / 1_000_000_000).toFixed(4) + ' SOL',
+          privacyMode: cfg.usePrivacyMode ?? false,
+          fundingWallet: fundingWalletAddress || 'frontend'
+        });
+        return { wallet: w.pubkey, funded: false, privacyMode: cfg.usePrivacyMode ?? false };
+      }));
+      
+      // Wait for all funding to complete
+      const fundingResults = await Promise.all(fundingPromises);
+      const failed = fundingResults.filter(r => r && !r.funded && !r.skipped && !r.privacyMode);
+      if (failed.length > 0) {
+        throw new Error(`${failed.length} wallet(s) failed to fund`);
+      }
+      
+      // For privacy mode, wait longer for frontend to process
+      const privacyCount = fundingResults.filter(r => r && r.privacyMode).length;
+      if (privacyCount > 0) {
+        log('INFO', 'FUNDING_WAIT', 'Waiting for privacy funding to complete...', { waitMs: 5000, privacyCount });
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } else {
+        log('INFO', 'FUNDING_WAIT', 'Waiting for funding confirmations...', { waitMs: 2000 });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      
+      // Final verification: Check all wallets have sufficient balance
+      // Wait a bit longer for frontend transfers to confirm on-chain
+      log('INFO', 'FUNDING_VERIFY', 'Waiting for transfers to confirm, then verifying all wallets are funded...', {});
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Extra 5 seconds for confirmations
+      
+      const verificationResults = await Promise.all(wallets.map(async (w, index) => {
+        const requiredLamports = walletFundingAmounts.get(index) ?? 50_000_000;
+        const requiredWithBuffer = requiredLamports + 10_000_000;
+        const bal = await getSolBalanceLamports(conn, new PublicKey(w.pubkey));
+        // Use actual balance if it's less than required (frontend may have adjusted)
+        const actualAvailable = bal - BigInt(10_000_000); // Minus fees
+        const funded = actualAvailable > BigInt(0); // At least some balance for buying
+        if (!funded) {
+          log('WARN', 'FUND_VERIFY_FAIL', 'Wallet has insufficient balance for buying', {
+            wallet: w.pubkey,
+            balance: (Number(bal) / 1e9).toFixed(4) + ' SOL',
+            required: (requiredWithBuffer / 1e9).toFixed(4) + ' SOL',
+            available: (Number(actualAvailable) / 1e9).toFixed(4) + ' SOL'
           });
-          log('INFO', 'PRIVACY_FUNDING', 'Privacy funding requested', { 
-            wallet: w.pubkey, 
-            amount: (requiredLamports / 1_000_000_000).toFixed(4) + ' SOL'
+        } else if (bal < BigInt(requiredWithBuffer)) {
+          log('INFO', 'FUND_VERIFY_ADJUSTED', 'Wallet funded with adjusted amount (less than calculated)', {
+            wallet: w.pubkey,
+            balance: (Number(bal) / 1e9).toFixed(4) + ' SOL',
+            calculated: (requiredWithBuffer / 1e9).toFixed(4) + ' SOL',
+            available: (Number(actualAvailable) / 1e9).toFixed(4) + ' SOL'
           });
-        } else {
-          // Direct transfer (non-privacy mode)
-          const sig = await transferSol(conn, funding, to, requiredWithBuffer);
-          log('INFO', 'FUND_WALLET', 'Funded wallet (direct)', { wallet: w.pubkey, sig, amount: requiredWithBuffer });
         }
-      })));
+        return { wallet: w.pubkey, funded, balance: bal, available: actualAvailable };
+      }));
+      
+      const unfunded = verificationResults.filter(r => !r.funded);
+      if (unfunded.length > 0) {
+        log('ERROR', 'FUNDING_INCOMPLETE', `${unfunded.length} wallet(s) not properly funded`, {
+          unfunded: unfunded.map(u => ({ wallet: u.wallet, balance: (Number(u.balance) / 1e9).toFixed(4) + ' SOL' }))
+        });
+        // Don't throw - let buys attempt and fail with clear error messages
+      } else {
+        log('INFO', 'FUNDING_COMPLETE', 'All wallets verified and ready for buys', {
+          wallets: verificationResults.map(r => ({
+            wallet: r.wallet,
+            balance: (Number(r.balance) / 1e9).toFixed(4) + ' SOL',
+            available: (Number(r.available) / 1e9).toFixed(4) + ' SOL'
+          }))
+        });
+      }
     }
 
     // Buy SOL -> token per wallet (non-bundled) with confirmations
@@ -370,9 +502,49 @@ export function createUltibotEngine(opts: {
         return; // Skip this wallet
       }
 
-      // Get required funding amount for this wallet
-      const requiredLamports = walletFundingAmounts.get(index) ?? 50_000_000;
-      const spendLamports = BigInt(requiredLamports);
+      // Get wallet balance and use actual available balance for buy (frontend may have adjusted funding)
+      let spendLamports: bigint;
+      
+      if (!cfg.dryRun) {
+        try {
+          const walletBalance = await getSolBalanceLamports(conn, kp.publicKey);
+          const feesNeeded = BigInt(10_000_000); // 0.01 SOL for fees
+          const availableForBuy = walletBalance - feesNeeded;
+          
+          // Use the calculated amount OR the actual available balance (whichever is smaller)
+          const calculatedAmount = BigInt(walletFundingAmounts.get(index) ?? 50_000_000);
+          spendLamports = availableForBuy > calculatedAmount ? calculatedAmount : (availableForBuy > BigInt(0) ? availableForBuy : BigInt(0));
+          
+          if (spendLamports <= BigInt(0)) {
+            const errorMsg = `Insufficient balance: ${walletBalance} lamports, need at least ${feesNeeded} lamports (${Number(feesNeeded) / 1e9} SOL) for fees`;
+            log('ERROR', 'BUY_FAIL', errorMsg, { 
+              wallet: w.pubkey, 
+              balance: walletBalance.toString(),
+              available: availableForBuy.toString(),
+              calculated: calculatedAmount.toString(),
+              dryRun: cfg.dryRun 
+            });
+            throw new Error(errorMsg);
+          }
+          
+          // Log if using adjusted amount
+          if (spendLamports < calculatedAmount) {
+            log('INFO', 'BUY_AMOUNT_ADJUSTED', 'Using adjusted buy amount based on actual wallet balance', {
+              wallet: w.pubkey,
+              calculated: (Number(calculatedAmount) / 1e9).toFixed(4) + ' SOL',
+              actual: (Number(spendLamports) / 1e9).toFixed(4) + ' SOL',
+              balance: (Number(walletBalance) / 1e9).toFixed(4) + ' SOL'
+            });
+          }
+        } catch (balanceError: any) {
+          const errorMsg = `Balance check failed: ${balanceError?.message || balanceError}`;
+          log('ERROR', 'BUY_FAIL', errorMsg, { wallet: w.pubkey, error: errorMsg, dryRun: cfg.dryRun });
+          throw balanceError;
+        }
+      } else {
+        // Dry run: use calculated amount
+        spendLamports = BigInt(walletFundingAmounts.get(index) ?? 50_000_000);
+      }
       
       try {
         if (!cfg.dryRun) {
@@ -474,6 +646,17 @@ export function createUltibotEngine(opts: {
         });
       } catch (e: any) {
         const msg = String(e?.message ?? e);
+        const errorDetails = {
+          message: msg,
+          stack: e?.stack ? String(e?.stack).substring(0, 500) : undefined,
+          name: e?.name,
+          code: e?.code,
+          cause: e?.cause ? String(e?.cause) : undefined,
+        };
+        
+        // Log detailed error for debugging
+        console.error(`[BUY_FAIL] Wallet ${w.pubkey} buy error:`, errorDetails);
+        
         insertUltibotTrade(opts.db, {
           id: nanoid(),
           tsMs: Date.now(),
@@ -483,9 +666,15 @@ export function createUltibotEngine(opts: {
           outMint: cfg.tokenMint,
           inAmount: spendLamports.toString(),
           status: 'FAILED',
-          error: msg,
+          error: JSON.stringify(errorDetails),
         });
-        log('ERROR', 'BUY_FAIL', 'Wallet buy failed', { wallet: w.pubkey, error: msg, dryRun: cfg.dryRun });
+        log('ERROR', 'BUY_FAIL', `Wallet buy failed: ${msg}`, { 
+          wallet: w.pubkey, 
+          error: msg,
+          errorDetails,
+          spendLamports: spendLamports.toString(),
+          dryRun: cfg.dryRun 
+        });
       }
     })));
   }
@@ -1051,8 +1240,21 @@ export function createUltibotEngine(opts: {
       try {
         await performParallelBuys({ cfg, cycle, wallets, mintPk, decimals, supplyRaw, priceUsd });
         return;
-      } catch (e) {
-        log('ERROR', 'BUY_FAIL', 'Parallel buys failed', { error: String((e as any)?.message ?? e) });
+      } catch (e: any) {
+        const errorMsg = String(e?.message ?? e);
+        const errorStack = e?.stack ? String(e?.stack).substring(0, 500) : undefined;
+        log('ERROR', 'BUY_FAIL', 'Parallel buys failed', { 
+          error: errorMsg,
+          stack: errorStack,
+          cycleId: cycle.id,
+          wallets: wallets.length
+        });
+        console.error('[BUY_FAIL] Parallel buys error details:', {
+          message: errorMsg,
+          stack: errorStack,
+          cycleId: cycle.id,
+          walletCount: wallets.length
+        });
         // Continue to monitoring phase instead of failing the tick
       }
     }

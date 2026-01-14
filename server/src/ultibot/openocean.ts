@@ -404,6 +404,7 @@ export async function swapWithFallback(params: {
   dryRun?: boolean;
 }): Promise<SwapResult> {
   // 1) OpenOcean (preferred)
+  let openOceanError: any = null;
   try {
     return await openOceanSwap({
       connection: params.connection,
@@ -415,7 +416,17 @@ export async function swapWithFallback(params: {
       dryRun: params.dryRun,
     });
   } catch (e) {
-    // 2) Raydium on-chain SDK fallback (limited)
+    openOceanError = e;
+    console.warn(`[swapWithFallback] OpenOcean swap failed, trying Raydium fallback:`, {
+      error: String(e?.message || e),
+      inMint: params.inMint,
+      outMint: params.outMint,
+      amountIn: params.amountIn.toString(),
+    });
+  }
+  
+  // 2) Raydium on-chain SDK fallback (limited)
+  try {
     return await raydiumFallbackSwap({
       connection: params.connection,
       owner: params.owner,
@@ -425,5 +436,9 @@ export async function swapWithFallback(params: {
       slippagePct: params.slippagePct,
       dryRun: params.dryRun,
     });
+  } catch (e) {
+    const errorMsg = `Both OpenOcean and Raydium swaps failed. OpenOcean: ${String(openOceanError?.message || openOceanError)}, Raydium: ${String(e?.message || e)}`;
+    console.error(`[swapWithFallback] All swap methods failed:`, errorMsg);
+    throw new Error(errorMsg);
   }
 }

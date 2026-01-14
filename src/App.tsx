@@ -26,7 +26,7 @@ import MarketMaker from './components/MarketMaker';
 import { parseWalletCSV, parseAnonPayCSV } from './services/csvService';
 import { AppState, Wallet, WalletGroup, TradeConfig, Transaction, MarketData, SpecialWallet, CyclePhase, StrategyPreset, SpecialRole, StrategyConfig, PrivacyState, PrivacyQueueItem, AppTab, AnonPayRecipient, UserRole, UserProfile, WalletProvider, CleanerDestination, CleanerStage, TokenBalance, PauseMode } from './types';
 import * as solanaWeb3 from "@solana/web3.js";
-import { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
+import { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL, VersionedTransaction, Transaction as SolanaTransaction, SystemProgram } from "@solana/web3.js";
 import nacl from 'tweetnacl';
 import {
   getAssociatedTokenAddress,
@@ -35,6 +35,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { PrivacyCashDirect } from "./lib/privacyCashDirect";
+import bs58 from 'bs58';
 
 // --- Helpers ---
 const generateAddress = () => `Sol${Math.random().toString(36).substring(2, 8)}...${Math.random().toString(36).substring(2, 6)}`;
@@ -213,12 +214,12 @@ const loadUltibotConfig = async () => {
 useEffect(() => {
   if (getToken()) {
     loadUltibotConfig();
-    
+
     // Refresh balances for wallets that have private keys saved (after config loads)
     const refreshWalletBalances = async () => {
       // Wait a bit for config to load
       await new Promise(resolve => setTimeout(resolve, 500));
-      
+
       for (const wallet of specialWallets) {
         if (wallet.privateKey) {
           try {
@@ -229,7 +230,7 @@ useEffect(() => {
                 rpcUrl: rpcUrl || undefined
               })
             });
-            
+
             if (res.ok) {
               const data = await res.json();
               setSpecialWallets(prev => prev.map(w => {
@@ -249,7 +250,7 @@ useEffect(() => {
         }
       }
     };
-    
+
     setTimeout(refreshWalletBalances, 1000);
   }
 }, [isLoggedIn]);
@@ -288,7 +289,43 @@ const [unwhitelistedPct, setUnwhitelistedPct] = useState<number>(0);
 const socketRef = useRef<Socket | null>(null);
 const walletGroupsRef = useRef<WalletGroup[]>([]);
 const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
-  const [specialWallets, setSpecialWallets] = useState<SpecialWallet[]>(INITIAL_SPECIAL_WALLETS);
+  // Load special wallets from localStorage if available
+  const loadSpecialWallets = (): SpecialWallet[] => {
+    try {
+      const stored = localStorage.getItem('specialWallets');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        // Only restore if it's a valid array
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load special wallets from localStorage:', e);
+    }
+    return INITIAL_SPECIAL_WALLETS;
+  };
+
+  const [specialWallets, setSpecialWallets] = useState<SpecialWallet[]>(loadSpecialWallets());
+  const specialWalletsRef = useRef<SpecialWallet[]>(specialWallets);
+  
+  // Keep ref in sync with state and persist to localStorage
+  useEffect(() => {
+    specialWalletsRef.current = specialWallets;
+    // Persist to localStorage (but don't store private keys for security - they're already in memory)
+    // Only store addresses and balances
+    try {
+      const safeWallets = specialWallets.map(w => ({
+        role: w.role,
+        address: w.address,
+        balanceSol: w.balanceSol,
+        // Don't store privateKey in localStorage for security
+      }));
+      localStorage.setItem('specialWallets', JSON.stringify(safeWallets));
+    } catch (e) {
+      console.error('Failed to save special wallets to localStorage:', e);
+    }
+  }, [specialWallets]);
   const [privacyState, setPrivacyState] = useState<PrivacyState>(INITIAL_PRIVACY_STATE);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [chartData, setChartData] = useState<{ time: string; marketCap: number; price: number }[]>([]);
@@ -660,18 +697,18 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     } else if (apiBaseUrl) {
       serverUrl = apiBaseUrl;
     } else if (isLocal) {
-      serverUrl = 'http://3.21.170.124:8787';
+      serverUrl = 'http://localhost:8787';
     } else {
       serverUrl = window.location.origin;
     }
-    
+
     console.log(`Connecting to Socket.IO server: ${serverUrl}`, {
       VITE_API_BASE_URL: apiBaseUrl,
       VITE_SOCKET_BASE_URL: socketBaseUrl,
       isLocal,
       fallback: window.location.origin
     });
-    
+
     const socket = socketIOClient(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -693,7 +730,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
     socket.on('connect_error', (error) => {
       console.error('Socket.IO connection error:', error);
-      addLog(`🔌 Connection error: ${error.message}`);
+        addLog(`🔌 Connection error: ${error.message}`);
     });
 
     socket.on('unwhitelisted_pct', (data: { unwhitelistedPctTopAccounts: number; ts: number }) => {
@@ -845,30 +882,128 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       }
     });
 
-    // Listen for privacy funding requests from backend
-    // Use state setter to access current values
+    // Listen for funding requests from backend
+    // Frontend handles all funding (both privacy and direct) for security - no private keys in backend
     socket.on('privacy_funding_request', (data: any) => {
-      console.log('Privacy funding request:', data);
-      setSpecialWallets(current => {
-        const fundingWallet = current.find(w => w.role === 'FUNDING');
-        if (fundingWallet && fundingWallet.privateKey) {
-          // Use existing privacy transfer system
-          queuePrivacyTransfer(
-            'FUNDING',
-            undefined,
-            undefined,
-            data.walletId,
-            data.amountSol,
-            1000 + (data.walletIndex * 800), // Stagger delays
-            data.walletPubkey
-          );
-          addLog(`🛡️ Privacy funding queued: ${data.amountSol.toFixed(4)} SOL → Wallet ${data.walletIndex + 1}`);
-        } else {
-          addLog(`⚠️ Privacy funding requested but FUNDING wallet key not set`);
-        }
-        return current; // Return unchanged
+      console.log('Funding request from backend:', data);
+      
+      // Use ref to get current state (always up-to-date)
+      const currentWallets = specialWalletsRef.current;
+      const fundingWallet = currentWallets.find(w => w.role === 'FUNDING');
+      console.log('Funding wallet from ref:', fundingWallet ? { 
+        role: fundingWallet.role, 
+        address: fundingWallet.address, 
+        hasPrivateKey: !!fundingWallet.privateKey, 
+        privateKeyLength: fundingWallet.privateKey?.length,
+        privateKeyPreview: fundingWallet.privateKey ? fundingWallet.privateKey.substring(0, 20) + '...' : 'none'
+      } : 'not found');
+      
+      if (!fundingWallet) {
+        addLog(`⚠️ Funding requested but FUNDING wallet not found in frontend state`);
+        return;
+      }
+      
+      if (!fundingWallet.privateKey || fundingWallet.privateKey.trim() === '') {
+        addLog(`⚠️ Funding requested but FUNDING wallet private key is empty. Please import the private key in the FUNDING wallet section.`);
+        return;
+      }
+      
+      // Process funding asynchronously (capture fundingWallet from closure)
+      (async () => {
+        try {
+            // Check actual funding wallet balance and adjust amount
+            const rpcEndpoint = rpcUrl || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
+            const connection = new Connection(rpcEndpoint, 'confirmed');
+            const fundingPubkey = new PublicKey(fundingWallet.address);
+            const fundingBalance = await connection.getBalance(fundingPubkey, 'confirmed');
+            const fundingBalanceSol = fundingBalance / LAMPORTS_PER_SOL;
+            
+            // Update the balance in state
+            setSpecialWallets(prev => prev.map(w => 
+              w.role === 'FUNDING' ? { ...w, balanceSol: fundingBalanceSol } : w
+            ));
+            
+            // Adjust amount based on available balance
+            // Reserve 0.01 SOL for fees per wallet, then distribute remaining
+            // For multiple wallets, we need to reserve fees for ALL wallets, not just one
+            const totalWallets = data.walletIndex !== undefined ? (data.walletIndex + 1) : 1; // Estimate based on index
+            const feesNeededPerWallet = 0.01;
+            // Reserve fees for at least 2 wallets (minimum), but ideally check how many wallets need funding
+            const minFeesReserved = feesNeededPerWallet * Math.max(2, totalWallets);
+            const availableForDistribution = fundingBalanceSol - minFeesReserved;
+            
+            let adjustedAmount = data.amountSol;
+            if (availableForDistribution <= 0) {
+              addLog(`❌ Insufficient balance in FUNDING wallet: ${fundingBalanceSol.toFixed(4)} SOL (need at least ${minFeesReserved.toFixed(4)} SOL for fees for ${Math.max(2, totalWallets)} wallet(s))`);
+              return;
+            }
+            
+            if (availableForDistribution < data.amountSol) {
+              // Adjust to available balance (distribute evenly if multiple wallets)
+              adjustedAmount = Math.max(0, availableForDistribution);
+              if (adjustedAmount > 0) {
+                addLog(`⚠️ Adjusting funding amount from ${data.amountSol.toFixed(4)} to ${adjustedAmount.toFixed(4)} SOL (available: ${fundingBalanceSol.toFixed(4)} SOL, reserved ${minFeesReserved.toFixed(4)} SOL for fees)`);
+              } else {
+                addLog(`❌ Insufficient balance in FUNDING wallet: ${fundingBalanceSol.toFixed(4)} SOL (need at least ${minFeesReserved.toFixed(4)} SOL for fees)`);
+                return;
+              }
+            }
+            
+            if (data.usePrivacyMode) {
+              // Use privacy transfer system
+              queuePrivacyTransfer(
+                'FUNDING',
+                undefined,
+                undefined,
+                data.walletId,
+                adjustedAmount,
+                1000 + (data.walletIndex * 800), // Stagger delays
+                data.walletPubkey
+              );
+              addLog(`🛡️ Privacy funding queued: ${adjustedAmount.toFixed(4)} SOL → Wallet ${data.walletIndex + 1}`);
+            } else {
+              // Direct transfer (non-privacy mode)
+              queuePrivacyTransfer(
+                'FUNDING',
+                undefined,
+                undefined,
+                data.walletId,
+                adjustedAmount,
+                1000 + (data.walletIndex * 800),
+                data.walletPubkey
+              );
+              addLog(`💰 Direct funding queued: ${adjustedAmount.toFixed(4)} SOL → Wallet ${data.walletIndex + 1}`);
+            }
+          } catch (error: any) {
+            console.error('Failed to check funding wallet balance:', error);
+            addLog(`❌ Failed to check FUNDING wallet balance: ${error?.message || error}`);
+            // Still queue with requested amount, but log warning
+            if (data.usePrivacyMode) {
+              queuePrivacyTransfer(
+                'FUNDING',
+                undefined,
+                undefined,
+                data.walletId,
+                data.amountSol,
+                1000 + (data.walletIndex * 800),
+                data.walletPubkey
+              );
+              addLog(`🛡️ Privacy funding queued (balance check failed): ${data.amountSol.toFixed(4)} SOL → Wallet ${data.walletIndex + 1}`);
+            } else {
+              queuePrivacyTransfer(
+                'FUNDING',
+                undefined,
+                undefined,
+                data.walletId,
+                data.amountSol,
+                1000 + (data.walletIndex * 800),
+                data.walletPubkey
+              );
+              addLog(`💰 Direct funding queued (balance check failed): ${data.amountSol.toFixed(4)} SOL → Wallet ${data.walletIndex + 1}`);
+            }
+          }
+        })();
       });
-    });
 
     // Listen for privacy profit transfers
     socket.on('privacy_profit_transfer', (data: any) => {
@@ -1086,23 +1221,23 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       addLog("🔐 Admin access granted. Token saved.");
     } else {
       // No existing profile, create admin profile
-      const profile: UserProfile = {
-        id: 'admin',
-        email: 'admin',
-        name: 'Administrator',
-        username: 'admin',
-        provider: 'EMAIL',
-        role: 'OWNER',
-        wallet: '',
-        promoCode: 'ADMIN',
-        referredBy: null,
-        twitterHandle: null,
-        tiktokHandle: null,
-        facebookHandle: null,
-        createdAt: Date.now(),
-        lastLogin: Date.now(),
-        loginCount: 1,
-      };
+    const profile: UserProfile = {
+      id: 'admin',
+      email: 'admin',
+      name: 'Administrator',
+      username: 'admin',
+      provider: 'EMAIL',
+      role: 'OWNER',
+      wallet: '',
+      promoCode: 'ADMIN',
+      referredBy: null,
+      twitterHandle: null,
+      tiktokHandle: null,
+      facebookHandle: null,
+      createdAt: Date.now(),
+      lastLogin: Date.now(),
+      loginCount: 1,
+    };
       setUserProfile(profile);
       setCurrentUserRole('OWNER');
       addLog("🔐 Authenticated as OWNER.");
@@ -1140,7 +1275,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           console.error('Logout tracking error:', e);
         }
       }
-      
+
       setUserProfile(null);
       setCurrentUserRole('USER');
       setActiveTab('ANONPAY');
@@ -1258,7 +1393,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       if (provider && provider.disconnect) {
           await provider.disconnect();
       }
-      
+
       const solflare = (window as any).solflare;
       if (solflare && solflare.disconnect) {
           await solflare.disconnect();
@@ -1345,12 +1480,12 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
               const resp = await walletObj.connect();
               // Handle different response structures (Phantom vs Solflare)
               const pubKey = resp?.publicKey?.toString() || walletObj.publicKey?.toString();
-              
+
               if (pubKey) {
                   setPendingProvider(provider);
                   // Pass walletObj and provider directly to avoid state timing issues
                   finishConnection(provider, pubKey, walletObj);
-              } else {
+                  } else {
                   throw new Error("No public key returned");
               }
           } catch (connErr) {
@@ -1368,7 +1503,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     setPendingWalletAddress(address);
     setPendingProvider(provider);
     setShowWalletModal(false);
-    
+
     // Check if user already has a profile
     try {
       const checkResponse = await fetch(`/api/profile/check/${address}`);
@@ -1452,7 +1587,7 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
           signature,
           publicKeyBytes
         );
-        
+
         if (!isValid) {
           throw new Error('Signature verification failed. The signature does not match your wallet.');
         }
@@ -1465,15 +1600,15 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
 
       // Sign in existing user with verified signature
       const response = await fetch('/api/profile/connect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
           wallet: walletAddress,
           twitterHandle: profileTwitter?.trim() || undefined,
           tiktokHandle: profileTikTok?.trim() || undefined,
           facebookHandle: profileFacebook?.trim() || undefined,
-        }),
-      });
+              }),
+            });
       
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -1486,30 +1621,30 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
       setUserPromoCode(data.promoCode);
       
       // Set user profile
-      setUserProfile({
+          setUserProfile({
         id: walletAddress,
-        email: '',
+            email: '',
         name: data.username || `Wallet ${walletAddress.substring(0, 6)}`,
-        provider: provider,
-        role: 'USER',
+            provider: provider,
+            role: 'USER',
         wallet: walletAddress,
-        username: data.username,
-        promoCode: data.promoCode,
+            username: data.username,
+            promoCode: data.promoCode,
         referredBy: data.referredBy,
         twitterHandle: data.twitterHandle || profileTwitter?.trim() || undefined,
         tiktokHandle: data.tiktokHandle || profileTikTok?.trim() || undefined,
         facebookHandle: data.facebookHandle || profileFacebook?.trim() || undefined,
-      });
-      
-      setConnectedProvider(provider);
+          });
+
+          setConnectedProvider(provider);
       setConnectedAddress(walletAddress);
-      setUserWalletConnected(true);
-      setPendingWalletAddress('');
+          setUserWalletConnected(true);
+          setPendingWalletAddress('');
       setProfileTwitter('');
       setProfileTikTok('');
       setProfileFacebook('');
       await fetchWalletBalances(walletAddress);
-      
+
       addLog(`💳 Signed in with ${provider}. Address: ${walletAddress.substring(0,6)}...`);
       addLog(`✅ Welcome back! Username: ${data.username || 'User'}, Promo code: ${data.promoCode}`);
     } catch (err: any) {
@@ -1784,6 +1919,9 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
         return w;
       }));
       
+      // Note: Private keys are stored only in frontend for security
+      // Backend will use frontend privacy funding system via events
+      
       addLog(`🔐 ${editingWalletRole} Wallet keys saved successfully!`);
       setShowKeyModal(false);
       setTempPrivateKey(''); // Clear the input
@@ -1834,37 +1972,72 @@ const [walletGroups, setWalletGroups] = useState<WalletGroup[]>([]);
     try {
       // Try JSON array format
       const cleaned = privateKey.trim();
+      
+      // Log the format for debugging (first 50 chars only)
+      const preview = cleaned.length > 50 ? cleaned.substring(0, 50) + '...' : cleaned;
+      console.log('Parsing private key, format preview:', preview, 'length:', cleaned.length);
+      
       try {
         const arr = JSON.parse(cleaned);
         if (Array.isArray(arr)) {
-          const bytes = Uint8Array.from(arr);
-          keypair = Keypair.fromSecretKey(bytes);
+          if (arr.length === 64 || arr.length === 32) {
+            const bytes = Uint8Array.from(arr);
+            keypair = Keypair.fromSecretKey(bytes);
+            console.log('Successfully parsed as JSON array, length:', arr.length);
+          } else {
+            throw new Error(`JSON array has wrong length: ${arr.length} (expected 32 or 64)`);
+          }
         } else {
           throw new Error('Not a JSON array');
         }
-      } catch {
-        // Try hex format
+      } catch (jsonError) {
+        // Try hex format (64 chars for 32 bytes, or 128 chars for 64 bytes)
         const hexInput = cleaned.startsWith('0x') ? cleaned.slice(2) : cleaned;
-        if (/^[0-9a-fA-F]+$/.test(hexInput) && hexInput.length === 64) {
-          const bytes = new Uint8Array(32);
-          for (let i = 0; i < 64; i += 2) {
-            bytes[i / 2] = parseInt(hexInput.substring(i, i + 2), 16);
+        if (/^[0-9a-fA-F]+$/.test(hexInput)) {
+          if (hexInput.length === 64) {
+            // 32-byte secret key (64 hex chars)
+            const bytes = new Uint8Array(32);
+            for (let i = 0; i < 64; i += 2) {
+              bytes[i / 2] = parseInt(hexInput.substring(i, i + 2), 16);
+            }
+            keypair = Keypair.fromSecretKey(bytes);
+            console.log('Successfully parsed as hex (64 chars)');
+          } else if (hexInput.length === 128) {
+            // 64-byte keypair (128 hex chars) - use first 32 bytes
+            const bytes = new Uint8Array(32);
+            for (let i = 0; i < 64; i += 2) {
+              bytes[i / 2] = parseInt(hexInput.substring(i, i + 2), 16);
+            }
+            keypair = Keypair.fromSecretKey(bytes);
+            console.log('Successfully parsed as hex (128 chars, using first 32 bytes)');
+          } else {
+            throw new Error(`Hex string has wrong length: ${hexInput.length} (expected 64 or 128)`);
           }
-          keypair = Keypair.fromSecretKey(bytes);
         } else {
-          // Try base58
-          // Try base58 (fallback - may not work in browser without bs58)
+          // Try base58 (Solana standard format)
           try {
-            // @ts-ignore - bs58 may not be available
-            const bs58 = require('bs58');
             const decoded = bs58.decode(cleaned);
-            keypair = Keypair.fromSecretKey(decoded);
-          } catch {
-            throw new Error('Invalid private key format. Supported: JSON array, hex (64 chars), or base58');
+            // bs58.decode returns a Uint8Array in browser
+            const decodedBytes = decoded instanceof Uint8Array ? decoded : new Uint8Array(decoded);
+            
+            if (decodedBytes.length === 32) {
+              // 32-byte secret key
+              keypair = Keypair.fromSecretKey(decodedBytes);
+              console.log('Successfully parsed as base58 (32 bytes)');
+            } else if (decodedBytes.length === 64) {
+              // 64-byte keypair (secret + public seed) - Keypair.fromSecretKey accepts 64-byte arrays
+              keypair = Keypair.fromSecretKey(decodedBytes);
+              console.log('Successfully parsed as base58 (64 bytes)');
+            } else {
+              throw new Error(`Base58 decoded length is wrong: ${decodedBytes.length} (expected 32 or 64)`);
+            }
+          } catch (base58Error: any) {
+            throw new Error(`Invalid private key format. Length: ${cleaned.length}, First chars: ${preview}. Supported: JSON array [0-255,...], hex (64 or 128 chars), or base58. Error: ${base58Error?.message || base58Error}`);
           }
         }
       }
     } catch (error: any) {
+      console.error('Private key parsing error:', error);
       throw new Error(`Failed to parse private key: ${error.message}`);
     }
 
@@ -2083,17 +2256,39 @@ const executeAnonPayBatch = async () => {
         addLog(`🔐 Initializing Privacy Cash...`);
         await privacyCash.initialize();
 
-        // Process each recipient with automatic Privacy Cash transfer (deposit + withdraw)
+        // Calculate total amount needed (with buffer for fees)
+        const totalAmountLamports = valid.reduce((sum, r) => sum + Math.round(r.amount * 10 ** 9), 0);
+        const totalAmountWithBuffer = Math.ceil(totalAmountLamports * 1.05); // 5% buffer for fees
+        
+        // Step 1: Check balance and deposit if needed (ONE signature for deposit only)
+        addLog(`💰 Checking Privacy Cash balance and depositing if needed...`);
+        const balance = await privacyCash.getPrivateBalance();
+        const balanceLamports = balance.lamports;
+        
+        if (balanceLamports < totalAmountWithBuffer) {
+          const depositAmount = Math.ceil(totalAmountWithBuffer - balanceLamports);
+          const depositAmountInSol = depositAmount / 1e9;
+          addLog(`💳 Depositing ${depositAmountInSol.toFixed(4)} SOL to Privacy Cash (ONE signature required)...`);
+          await privacyCash.deposit({ lamports: depositAmount });
+          addLog(`✅ Deposit completed. Waiting for confirmation...`);
+          await new Promise(resolve => setTimeout(resolve, 3000)); // Wait for deposit to confirm
+        } else {
+          addLog(`✅ Privacy Cash balance sufficient: ${(balanceLamports / 1e9).toFixed(4)} SOL`);
+        }
+
+        // Step 2: Execute all withdraws sequentially (NO signatures needed - handled by relayer)
+        addLog(`🛡️ Executing ${valid.length} withdraws (NO signatures needed - relayer handles them)...`);
         let successCount = 0;
+        
         for (let i = 0; i < valid.length; i++) {
           const recipient = valid[i];
           const amountLamports = Math.round(recipient.amount * 10 ** 9);
           
           try {
-            addLog(`🛡️ Processing automatic private transfer ${i + 1}/${valid.length}: ${recipient.amount} SOL to ${recipient.address.substring(0, 8)}...`);
+            addLog(`🛡️ Withdrawing ${recipient.amount} SOL to ${recipient.address.substring(0, 8)}... (${i + 1}/${valid.length})`);
             
-            // Use automatic private transfer (deposits if needed, then withdraws)
-            await privacyCash.privateTransfer({
+            // Withdraws don't need signatures - they're submitted to relayer
+            await privacyCash.withdraw({
               lamports: amountLamports,
               recipientAddress: recipient.address,
             });
@@ -2108,15 +2303,14 @@ const executeAnonPayBatch = async () => {
             );
             
             successCount++;
-            addLog(`✅ Automatic private transfer ${i + 1}/${valid.length} completed`);
+            addLog(`✅ Withdraw ${i + 1}/${valid.length} completed`);
             
-            // Small delay between transfers to avoid rate limiting (using configured delay)
+            // Small delay between withdraws to avoid rate limiting
             if (i < valid.length - 1 && anonPayDelaySeconds > 0) {
               await new Promise(resolve => setTimeout(resolve, anonPayDelaySeconds * 1000));
             }
           } catch (error: any) {
-            addLog(`❌ Private transfer ${i + 1}/${valid.length} failed: ${error.message}`);
-            // Continue with next transfer
+            addLog(`❌ Withdraw ${i + 1}/${valid.length} failed: ${error.message}`);
           }
         }
 
@@ -2135,16 +2329,24 @@ const executeAnonPayBatch = async () => {
     );
     const recipients = valid.map((r) => r.address);
 
-    // split into 15-transfer batches
+    // split into 15-transfer batches (Solana transaction size limit)
     const batches: string[][] = [];
     for (let i = 0; i < recipients.length; i += MAX_TRANSFERS_PER_TX)
       batches.push(recipients.slice(i, i + MAX_TRANSFERS_PER_TX));
 
-    addLog(`💰 Sending ${valid.length} transfers in ${batches.length} batch(es)...`);
+    addLog(`💰 Preparing ${valid.length} transfers in ${batches.length} batch(es)...`);
+    addLog(`📝 You will need to sign ${batches.length} time(s) (one signature per batch)`);
+
+    // Build all transactions first
+    const transactions: solanaWeb3.Transaction[] = [];
+    const batchRecipients: string[][] = []; // Track which recipients are in which batch
+    
+    const { blockhash } = await connection.getLatestBlockhash("finalized");
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
       const batch = batches[batchIndex];
       const tx = new solanaWeb3.Transaction();
+      const batchAddrs: string[] = [];
 
       for (let j = 0; j < batch.length; j++) {
         const addr = batch[j].trim();
@@ -2157,6 +2359,7 @@ const executeAnonPayBatch = async () => {
         }
 
         const amount = amountPerRecipient[batchIndex * MAX_TRANSFERS_PER_TX + j] || 0;
+        batchAddrs.push(addr);
 
         if (isSol) {
           tx.add(
@@ -2198,21 +2401,47 @@ const executeAnonPayBatch = async () => {
       }
 
       tx.feePayer = sender;
-      const { blockhash } = await connection.getLatestBlockhash("finalized");
       tx.recentBlockhash = blockhash;
+      
+      transactions.push(tx);
+      batchRecipients.push(batchAddrs);
+    }
 
-      const signed = await provider.signTransaction(tx);
-      const sig = await connection.sendRawTransaction(signed.serialize());
-      addLog(`📤 Batch ${batchIndex + 1}/${batches.length} sent: ${sig}`);
-      await connection.confirmTransaction(sig, "finalized");
+    // Sign all transactions at once using signAllTransactions
+    addLog(`✍️ Signing all ${transactions.length} batch transaction(s) at once...`);
+    const signedTransactions = await provider.signAllTransactions(transactions);
+    addLog(`✅ All transactions signed! Sending to network...`);
 
-      setAnonPayRecipients((p) =>
-        p.map((r) =>
-          batch.includes(r.address)
-            ? { ...r, status: "COMPLETED" as const }
-            : r
-        )
-      );
+    // Send all transactions
+    const signatures: string[] = [];
+    for (let i = 0; i < signedTransactions.length; i++) {
+      try {
+        const sig = await connection.sendRawTransaction(signedTransactions[i].serialize());
+        signatures.push(sig);
+        addLog(`📤 Batch ${i + 1}/${signedTransactions.length} sent: ${sig}`);
+      } catch (error: any) {
+        addLog(`❌ Failed to send batch ${i + 1}: ${error.message}`);
+      }
+    }
+
+    // Wait for all confirmations
+    addLog(`⏳ Waiting for confirmations...`);
+    for (let i = 0; i < signatures.length; i++) {
+      try {
+        await connection.confirmTransaction(signatures[i], "finalized");
+        addLog(`✅ Batch ${i + 1}/${signatures.length} confirmed`);
+        
+        // Mark recipients as completed
+        setAnonPayRecipients((p) =>
+          p.map((r) =>
+            batchRecipients[i].includes(r.address)
+              ? { ...r, status: "COMPLETED" as const }
+              : r
+          )
+        );
+      } catch (error: any) {
+        addLog(`⚠️ Batch ${i + 1} confirmation failed: ${error.message}`);
+      }
     }
 
     addLog(`✅ All ${valid.length} transfers completed successfully.`);
@@ -2457,8 +2686,8 @@ const executeAnonPayBatch = async () => {
           // Get source wallet (fromRole or fromWalletId) - access from closure
           let sourceWallet: SpecialWallet | undefined;
           let recipientAddress: string | undefined;
-          
-          if (item.fromRole) {
+              
+              if (item.fromRole) {
             sourceWallet = specialWallets.find(w => w.role === item.fromRole && w.privateKey);
           } else if (item.fromWalletId) {
             // Try to find wallet in walletGroups (for frontend-managed wallets)
@@ -2473,7 +2702,7 @@ const executeAnonPayBatch = async () => {
                 privateKey: wallet.privateKey,
                 balanceSol: wallet.balanceSol
               } as SpecialWallet;
-            } else {
+              } else {
               // Cycle wallet - private key is in backend, can't do privacy transfer from frontend
               // Backend should handle this or fall back to direct transfer
               console.warn('Cannot process privacy transfer from cycle wallet - private key not available in frontend:', item.fromWalletId);
@@ -2493,8 +2722,8 @@ const executeAnonPayBatch = async () => {
             const group = walletGroups.find(g => g.wallets.some(w => w.id === item.toWalletId));
             const wallet = group?.wallets.find(w => w.id === item.toWalletId);
             recipientAddress = wallet?.address;
-          }
-          
+              }
+
           if (!sourceWallet?.privateKey || !recipientAddress) {
             processing = false;
             return prev;
@@ -2509,7 +2738,17 @@ const executeAnonPayBatch = async () => {
                 queue: prevState.queue.map(q => q.id === queueItem.id ? { ...q, status: 'MIXING' } : q)
               }));
               
-              addLog(`🛡️ Processing privacy transfer: ${queueItem.amount.toFixed(4)} SOL from ${queueItem.fromRole || 'wallet'} to ${recipient.substring(0, 8)}...`);
+              const amountLamports = Math.round(queueItem.amount * LAMPORTS_PER_SOL);
+              
+              // Check if this is a direct transfer (for non-privacy mode funding)
+              // We detect this by checking if the recipient is a cycle wallet (toAddress but no toRole/toWalletId)
+              const isDirectTransfer = queueItem.toAddress && !queueItem.toRole && !queueItem.toWalletId;
+              
+              if (isDirectTransfer) {
+                addLog(`💰 Processing direct transfer: ${queueItem.amount.toFixed(4)} SOL from ${queueItem.fromRole || 'wallet'} to ${recipient.substring(0, 8)}...`);
+              } else {
+                addLog(`🛡️ Processing privacy transfer: ${queueItem.amount.toFixed(4)} SOL from ${queueItem.fromRole || 'wallet'} to ${recipient.substring(0, 8)}...`);
+              }
               
               // Create wallet provider from private key
               const walletProvider = createWalletProviderFromPrivateKey(source.privateKey!);
@@ -2518,27 +2757,84 @@ const executeAnonPayBatch = async () => {
               const rpcEndpoint = rpcUrl || 'https://mainnet.helius-rpc.com/?api-key=f6c5e503-b09f-49c4-b652-b398c331ecf6';
               const connection = new Connection(rpcEndpoint, 'confirmed');
               
-              // Create PrivacyCashDirect instance
-              const privacyCash = new PrivacyCashDirect({
-                connection,
-                wallet: walletProvider,
-                circuitBaseUrl: '/circuit2',
-                enableDebug: true,
-              });
-              
-              // Initialize
-              await privacyCash.initialize();
-              
-              // Execute private transfer
-              const amountLamports = Math.round(queueItem.amount * LAMPORTS_PER_SOL);
-              await privacyCash.privateTransfer({
-                lamports: amountLamports,
-                recipientAddress: recipient,
-              });
+              if (isDirectTransfer) {
+                // Direct transfer for non-privacy mode funding
+                // Use the same parsing logic as createWalletProviderFromPrivateKey
+                let fromKeypair: Keypair;
+                const cleaned = source.privateKey!.trim();
+                try {
+                  // Try JSON array format
+                  try {
+                    const arr = JSON.parse(cleaned);
+                    if (Array.isArray(arr)) {
+                      fromKeypair = Keypair.fromSecretKey(Uint8Array.from(arr));
+                    } else {
+                      throw new Error('Not a JSON array');
+                    }
+                  } catch {
+                    // Try hex format
+                    const hexInput = cleaned.startsWith('0x') ? cleaned.slice(2) : cleaned;
+                    if (/^[0-9a-fA-F]+$/.test(hexInput) && hexInput.length === 64) {
+                      const bytes = new Uint8Array(32);
+                      for (let i = 0; i < 64; i += 2) {
+                        bytes[i / 2] = parseInt(hexInput.substring(i, i + 2), 16);
+                      }
+                      fromKeypair = Keypair.fromSecretKey(bytes);
+                    } else {
+                      // Try base58
+                      try {
+                        // @ts-ignore - bs58 may not be available
+                        const bs58 = require('bs58');
+                        const decoded = bs58.decode(cleaned);
+                        fromKeypair = Keypair.fromSecretKey(decoded);
+                      } catch {
+                        throw new Error('Invalid private key format. Supported: JSON array, hex (64 chars), or base58');
+                      }
+                    }
+                  }
+                } catch (error: any) {
+                  throw new Error(`Failed to parse private key: ${error.message}`);
+                }
+                
+                const toPubkey = new PublicKey(recipient);
+                
+                const transaction = new SolanaTransaction().add(
+                  SystemProgram.transfer({
+                    fromPubkey: fromKeypair.publicKey,
+                    toPubkey: toPubkey,
+                    lamports: amountLamports,
+                  })
+                );
+                
+                const signature = await connection.sendTransaction(transaction, [fromKeypair], {
+                  skipPreflight: false,
+                  maxRetries: 2,
+                });
+                
+                await connection.confirmTransaction(signature, 'confirmed');
+                addLog(`✅ Direct transfer completed: ${queueItem.amount.toFixed(4)} SOL → ${recipient.substring(0, 8)}... (sig: ${signature.substring(0, 8)}...)`);
+              } else {
+                // Privacy transfer
+                const privacyCash = new PrivacyCashDirect({
+                  connection,
+                  wallet: walletProvider,
+                  circuitBaseUrl: '/circuit2',
+                  enableDebug: true,
+                });
+                
+                // Initialize
+                await privacyCash.initialize();
+                
+                // Execute private transfer
+                await privacyCash.privateTransfer({
+                  lamports: amountLamports,
+                  recipientAddress: recipient,
+                });
+              }
               
               // Update balances
               if (queueItem.fromRole) {
-                setSpecialWallets(wallets => wallets.map(w => 
+                 setSpecialWallets(wallets => wallets.map(w => 
                   w.role === queueItem.fromRole ? { ...w, balanceSol: w.balanceSol - queueItem.amount } : w
                 ));
               }
@@ -2546,20 +2842,20 @@ const executeAnonPayBatch = async () => {
               if (queueItem.toRole) {
                 setSpecialWallets(wallets => wallets.map(w => 
                   w.role === queueItem.toRole ? { ...w, balanceSol: w.balanceSol + queueItem.amount } : w
-                ));
+                 ));
               } else if (queueItem.toWalletId) {
                 // Update wallet in frontend-managed groups
-                setWalletGroups(groups => groups.map(g => ({
-                  ...g,
+                 setWalletGroups(groups => groups.map(g => ({
+                    ...g,
                   wallets: g.wallets.map(w => w.id === queueItem.toWalletId ? { ...w, balanceSol: w.balanceSol + queueItem.amount } : w)
-                })));
+                 })));
               } else if (queueItem.toAddress) {
                 // For external addresses (cycle wallets from backend, AnonPay recipients, etc.)
                 // Check if it's an AnonPay recipient first
                 const isAnonPayRecipient = anonPayRecipients.some(r => r.address === queueItem.toAddress);
                 if (isAnonPayRecipient) {
                   setAnonPayRecipients(prev => prev.map(r => r.address === queueItem.toAddress ? { ...r, status: 'COMPLETED' } : r));
-                }
+               }
                 // For cycle wallets from backend, we don't update frontend state
                 // (balances are tracked in backend database)
                 // Just log the successful transfer

@@ -6,7 +6,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
 
   const API_BASE =
-    env.VITE_API_BASE_URL || "http://localhost:8787";
+    env.VITE_API_BASE_URL || "http://3.16.15.1:8787";
 
   return {
     base: "/",
